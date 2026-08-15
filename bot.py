@@ -141,7 +141,6 @@ async def init_db():
 
     async with db_pool.acquire() as conn:
 
-        # Магазины
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS stores (
@@ -157,7 +156,6 @@ async def init_db():
             """
         )
 
-        # Курьеры
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS couriers (
@@ -172,7 +170,6 @@ async def init_db():
             """
         )
 
-        # Заказы
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS orders (
@@ -192,7 +189,6 @@ async def init_db():
             """
         )
 
-        # Фотографии заказов
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS order_photos (
@@ -208,7 +204,7 @@ async def init_db():
 
 
 # =========================================================
-# /START
+# START
 # =========================================================
 
 @dp.message(CommandStart())
@@ -1091,7 +1087,7 @@ async def courier_orders(message: Message):
 
 
 # =========================================================
-# КУРЬЕР ПРИНИМАЕТ ЗАКАЗ
+# ПРИНЯТЬ ЗАКАЗ
 # =========================================================
 
 @dp.callback_query(
@@ -1157,7 +1153,7 @@ async def accept_order_handler(
 
 
 # =========================================================
-# ЗАПРОС ФОТО ТОВАРА
+# ФОТО ТОВАРА
 # =========================================================
 
 @dp.callback_query(
@@ -1187,10 +1183,6 @@ async def pickup_photo_request(
     await callback.answer()
 
 
-# =========================================================
-# ПОЛУЧИЛИ ФОТО ТОВАРА
-# =========================================================
-
 @dp.message(
     CourierPhoto.pickup_photo,
     F.photo
@@ -1200,7 +1192,6 @@ async def pickup_photo_received(
     state: FSMContext,
 ):
     data = await state.get_data()
-
     order_id = data["order_id"]
 
     async with db_pool.acquire() as conn:
@@ -1217,7 +1208,6 @@ async def pickup_photo_received(
 
         if not courier:
             await state.clear()
-
             await message.answer(
                 "❌ Курьер не найден."
             )
@@ -1237,7 +1227,6 @@ async def pickup_photo_received(
 
         if not order:
             await state.clear()
-
             await message.answer(
                 "❌ Этот заказ недоступен."
             )
@@ -1416,7 +1405,7 @@ async def on_way_handler(
 
 
 # =========================================================
-# КУРЬЕР ПРИБЫЛ
+# ПРИБЫЛ К КЛИЕНТУ
 # =========================================================
 
 @dp.callback_query(
@@ -1481,7 +1470,7 @@ async def arrived_handler(
 
 
 # =========================================================
-# ЗАПРОС ФОТО ДОСТАВКИ
+# ФОТО ДОСТАВКИ
 # =========================================================
 
 @dp.callback_query(
@@ -1511,10 +1500,6 @@ async def delivery_photo_request(
     await callback.answer()
 
 
-# =========================================================
-# ПОЛУЧИЛИ ФОТО ДОСТАВКИ
-# =========================================================
-
 @dp.message(
     CourierPhoto.delivery_photo,
     F.photo
@@ -1524,7 +1509,6 @@ async def delivery_photo_received(
     state: FSMContext,
 ):
     data = await state.get_data()
-
     order_id = data["order_id"]
 
     async with db_pool.acquire() as conn:
@@ -1541,7 +1525,6 @@ async def delivery_photo_received(
 
         if not courier:
             await state.clear()
-
             await message.answer(
                 "❌ Курьер не найден."
             )
@@ -1561,7 +1544,6 @@ async def delivery_photo_received(
 
         if not order:
             await state.clear()
-
             await message.answer(
                 "❌ Этот заказ недоступен."
             )
@@ -1613,7 +1595,7 @@ async def delivery_photo_wrong_type(
 
 
 # =========================================================
-# ЗАВЕРШЕНИЕ ДОСТАВКИ
+# ДОСТАВЛЕН
 # =========================================================
 
 @dp.callback_query(
@@ -1771,7 +1753,6 @@ async def admin_handler(message: Message):
         f"📦 Новых заказов: {len(new_orders)}"
     )
 
-    # Заявки магазинов
     for store in stores:
 
         keyboard = InlineKeyboardMarkup(
@@ -1802,7 +1783,6 @@ async def admin_handler(message: Message):
             reply_markup=keyboard,
         )
 
-    # Заявки курьеров
     for courier in couriers:
 
         keyboard = InlineKeyboardMarkup(
@@ -1832,7 +1812,6 @@ async def admin_handler(message: Message):
             reply_markup=keyboard,
         )
 
-    # Новые заказы
     for order in new_orders:
 
         buttons = []
@@ -1884,7 +1863,7 @@ async def admin_handler(message: Message):
 
 
 # =========================================================
-# АДМИН — ОДОБРИТЬ МАГАЗИН
+# ОДОБРИТЬ МАГАЗИН
 # =========================================================
 
 @dp.callback_query(
@@ -1946,7 +1925,7 @@ async def approve_store_handler(
 
 
 # =========================================================
-# АДМИН — ОТКЛОНИТЬ МАГАЗИН
+# ОТКЛОНИТЬ МАГАЗИН
 # =========================================================
 
 @dp.callback_query(
@@ -1992,7 +1971,7 @@ async def reject_store_handler(
 
 
 # =========================================================
-# АДМИН — ОДОБРИТЬ КУРЬЕРА
+# ОДОБРИТЬ КУРЬЕРА
 # =========================================================
 
 @dp.callback_query(
@@ -2051,7 +2030,7 @@ async def approve_courier_handler(
 
 
 # =========================================================
-# АДМИН — ОТКЛОНИТЬ КУРЬЕРА
+# ОТКЛОНИТЬ КУРЬЕРА
 # =========================================================
 
 @dp.callback_query(
@@ -2097,7 +2076,7 @@ async def reject_courier_handler(
 
 
 # =========================================================
-# АДМИН — НАЗНАЧИТЬ ЗАКАЗ
+# НАЗНАЧИТЬ ЗАКАЗ КУРЬЕРУ
 # =========================================================
 
 @dp.callback_query(
@@ -2265,4 +2244,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
