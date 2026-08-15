@@ -48,6 +48,12 @@ dp = Dispatcher(storage=MemoryStorage())
 
 db_pool = None
 
+# =========================
+
+# КЛАВИАТУРЫ
+
+# =========================
+
 main_keyboard = ReplyKeyboardMarkup(
 
     keyboard=[
@@ -72,7 +78,7 @@ main_keyboard = ReplyKeyboardMarkup(
 
 )
 
-confirm_keyboard = ReplyKeyboardMarkup(
+registration_confirm_keyboard = ReplyKeyboardMarkup(
 
     keyboard=[
 
@@ -86,6 +92,48 @@ confirm_keyboard = ReplyKeyboardMarkup(
 
 )
 
+store_keyboard = ReplyKeyboardMarkup(
+
+    keyboard=[
+
+        [KeyboardButton(text="➕ Создать заказ")],
+
+        [
+
+            KeyboardButton(text="📦 Мои заказы"),
+
+            KeyboardButton(text="🏪 Профиль магазина"),
+
+        ],
+
+        [KeyboardButton(text="⬅️ Главное меню")],
+
+    ],
+
+    resize_keyboard=True,
+
+)
+
+order_confirm_keyboard = ReplyKeyboardMarkup(
+
+    keyboard=[
+
+        [KeyboardButton(text="✅ Создать заказ")],
+
+        [KeyboardButton(text="❌ Отменить заказ")],
+
+    ],
+
+    resize_keyboard=True,
+
+)
+
+# =========================
+
+# FSM
+
+# =========================
+
 class StoreRegistration(StatesGroup):
 
     store_name = State()
@@ -97,6 +145,28 @@ class StoreRegistration(StatesGroup):
     address = State()
 
     confirm = State()
+
+class OrderCreation(StatesGroup):
+
+    client_name = State()
+
+    client_phone = State()
+
+    delivery_address = State()
+
+    item = State()
+
+    delivery_time = State()
+
+    comment = State()
+
+    confirm = State()
+
+# =========================
+
+# DATABASE
+
+# =========================
 
 async def init_db():
 
@@ -134,6 +204,48 @@ async def init_db():
 
         )
 
+        await conn.execute(
+
+            """
+
+            CREATE TABLE IF NOT EXISTS orders (
+
+                id SERIAL PRIMARY KEY,
+
+                store_id INTEGER NOT NULL REFERENCES stores(id),
+
+                client_name TEXT NOT NULL,
+
+                client_phone TEXT NOT NULL,
+
+                pickup_address TEXT NOT NULL,
+
+                delivery_address TEXT NOT NULL,
+
+                item TEXT NOT NULL,
+
+                delivery_time TEXT NOT NULL,
+
+                comment TEXT,
+
+                status TEXT NOT NULL DEFAULT 'new',
+
+                courier_id BIGINT,
+
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+
+            )
+
+            """
+
+        )
+
+# =========================
+
+# START
+
+# =========================
+
 @dp.message(CommandStart())
 
 async def start_handler(message: Message, state: FSMContext):
@@ -150,6 +262,26 @@ async def start_handler(message: Message, state: FSMContext):
 
     )
 
+@dp.message(F.text == "⬅️ Главное меню")
+
+async def back_to_main(message: Message, state: FSMContext):
+
+    await state.clear()
+
+    await message.answer(
+
+        "Главное меню:",
+
+        reply_markup=main_keyboard,
+
+    )
+
+# =========================
+
+# МАГАЗИН
+
+# =========================
+
 @dp.message(F.text == "🏪 Магазин")
 
 async def store_start(message: Message, state: FSMContext):
@@ -162,7 +294,7 @@ async def store_start(message: Message, state: FSMContext):
 
             """
 
-            SELECT store_name, status
+            SELECT *
 
             FROM stores
 
@@ -176,25 +308,43 @@ async def store_start(message: Message, state: FSMContext):
 
     if store:
 
-        status_map = {
+        if store["status"] == "approved":
 
-            "pending": "⏳ Ожидает подтверждения",
+            await message.answer(
 
-            "approved": "✅ Одобрен",
+                f"🏪 {store['store_name']}\n\n"
 
-            "rejected": "❌ Отклонён",
+                "Выберите действие:",
 
-        }
+                reply_markup=store_keyboard,
 
-        await message.answer(
+            )
 
-            f"🏪 Магазин: {store['store_name']}\n"
+            return
 
-            f"Статус: {status_map.get(store['status'], store['status'])}"
+        if store["status"] == "pending":
 
-        )
+            await message.answer(
 
-        return
+                f"🏪 Магазин: {store['store_name']}\n\n"
+
+                "⏳ Ваша заявка ожидает подтверждения администратора."
+
+            )
+
+            return
+
+        if store["status"] == "rejected":
+
+            await message.answer(
+
+                f"🏪 Магазин: {store['store_name']}\n\n"
+
+                "❌ Ваша заявка была отклонена."
+
+            )
+
+            return
 
     await state.set_state(StoreRegistration.store_name)
 
@@ -205,6 +355,12 @@ async def store_start(message: Message, state: FSMContext):
         "Введите название магазина:"
 
     )
+
+# =========================
+
+# РЕГИСТРАЦИЯ МАГАЗИНА
+
+# =========================
 
 @dp.message(StoreRegistration.store_name)
 
@@ -266,17 +422,21 @@ async def address_handler(message: Message, state: FSMContext):
 
         "Отправить заявку?",
 
-        reply_markup=confirm_keyboard,
+        reply_markup=registration_confirm_keyboard,
 
     )
 
-@dp.message(StoreRegistration.confirm, F.text == "✅ Отправить заявку")
+@dp.message(
+
+    StoreRegistration.confirm,
+
+    F.text == "✅ Отправить заявку"
+
+)
 
 async def store_confirm_handler(message: Message, state: FSMContext):
 
     data = await state.get_data()
-
-    telegram_id = message.from_user.id
 
     async with db_pool.acquire() as conn:
 
@@ -316,7 +476,7 @@ async def store_confirm_handler(message: Message, state: FSMContext):
 
             """,
 
-            telegram_id,
+            message.from_user.id,
 
             data["store_name"],
 
@@ -340,9 +500,15 @@ async def store_confirm_handler(message: Message, state: FSMContext):
 
     )
 
-@dp.message(StoreRegistration.confirm, F.text == "❌ Отмена")
+@dp.message(
 
-async def store_cancel_handler(message: Message, state: FSMContext):
+    StoreRegistration.confirm,
+
+    F.text == "❌ Отмена"
+
+)
+
+async def registration_cancel(message: Message, state: FSMContext):
 
     await state.clear()
 
@@ -353,6 +519,472 @@ async def store_cancel_handler(message: Message, state: FSMContext):
         reply_markup=main_keyboard,
 
     )
+
+# =========================
+
+# ПРОФИЛЬ МАГАЗИНА
+
+# =========================
+
+@dp.message(F.text == "🏪 Профиль магазина")
+
+async def store_profile(message: Message):
+
+    async with db_pool.acquire() as conn:
+
+        store = await conn.fetchrow(
+
+            """
+
+            SELECT *
+
+            FROM stores
+
+            WHERE telegram_id = $1
+
+            """,
+
+            message.from_user.id,
+
+        )
+
+    if not store:
+
+        await message.answer("Магазин не найден.")
+
+        return
+
+    await message.answer(
+
+        "🏪 ПРОФИЛЬ МАГАЗИНА\n\n"
+
+        f"Название: {store['store_name']}\n"
+
+        f"👤 Контакт: {store['contact_name']}\n"
+
+        f"📞 Телефон: {store['phone']}\n"
+
+        f"📍 Адрес: {store['address']}\n"
+
+        f"✅ Статус: {store['status']}"
+
+    )
+
+# =========================
+
+# СОЗДАНИЕ ЗАКАЗА
+
+# =========================
+
+@dp.message(F.text == "➕ Создать заказ")
+
+async def create_order_start(message: Message, state: FSMContext):
+
+    async with db_pool.acquire() as conn:
+
+        store = await conn.fetchrow(
+
+            """
+
+            SELECT id, status
+
+            FROM stores
+
+            WHERE telegram_id = $1
+
+            """,
+
+            message.from_user.id,
+
+        )
+
+    if not store or store["status"] != "approved":
+
+        await message.answer(
+
+            "❌ Создавать заказы может только одобренный магазин."
+
+        )
+
+        return
+
+    await state.clear()
+
+    await state.set_state(OrderCreation.client_name)
+
+    await message.answer(
+
+        "📦 СОЗДАНИЕ ЗАКАЗА\n\n"
+
+        "Введите имя клиента:"
+
+    )
+
+@dp.message(OrderCreation.client_name)
+
+async def order_client_name(message: Message, state: FSMContext):
+
+    await state.update_data(client_name=message.text)
+
+    await state.set_state(OrderCreation.client_phone)
+
+    await message.answer(
+
+        "📞 Введите номер телефона клиента:"
+
+    )
+
+@dp.message(OrderCreation.client_phone)
+
+async def order_client_phone(message: Message, state: FSMContext):
+
+    await state.update_data(client_phone=message.text)
+
+    await state.set_state(OrderCreation.delivery_address)
+
+    await message.answer(
+
+        "📍 Введите адрес доставки клиента:"
+
+    )
+
+@dp.message(OrderCreation.delivery_address)
+
+async def order_delivery_address(message: Message, state: FSMContext):
+
+    await state.update_data(delivery_address=message.text)
+
+    await state.set_state(OrderCreation.item)
+
+    await message.answer(
+
+        "📦 Что нужно доставить?\n\n"
+
+        "Например:\n"
+
+        "Холодильник HOFMANN — 1 шт."
+
+    )
+
+@dp.message(OrderCreation.item)
+
+async def order_item(message: Message, state: FSMContext):
+
+    await state.update_data(item=message.text)
+
+    await state.set_state(OrderCreation.delivery_time)
+
+    await message.answer(
+
+        "🕐 Укажите желаемое время доставки.\n\n"
+
+        "Например:\n"
+
+        "Сегодня 15:00–18:00"
+
+    )
+
+@dp.message(OrderCreation.delivery_time)
+
+async def order_delivery_time(message: Message, state: FSMContext):
+
+    await state.update_data(delivery_time=message.text)
+
+    await state.set_state(OrderCreation.comment)
+
+    await message.answer(
+
+        "📝 Добавьте комментарий к заказу.\n\n"
+
+        "Например: 5 этаж, есть лифт.\n\n"
+
+        "Если комментария нет — напишите: Нет"
+
+    )
+
+@dp.message(OrderCreation.comment)
+
+async def order_comment(message: Message, state: FSMContext):
+
+    await state.update_data(comment=message.text)
+
+    data = await state.get_data()
+
+    async with db_pool.acquire() as conn:
+
+        store = await conn.fetchrow(
+
+            """
+
+            SELECT store_name, address
+
+            FROM stores
+
+            WHERE telegram_id = $1
+
+            """,
+
+            message.from_user.id,
+
+        )
+
+    await state.set_state(OrderCreation.confirm)
+
+    await message.answer(
+
+        "📦 ПРОВЕРЬТЕ ЗАКАЗ\n\n"
+
+        f"🏪 Магазин: {store['store_name']}\n"
+
+        f"📍 Забрать: {store['address']}\n\n"
+
+        f"👤 Клиент: {data['client_name']}\n"
+
+        f"📞 Телефон: {data['client_phone']}\n"
+
+        f"📍 Доставить: {data['delivery_address']}\n\n"
+
+        f"📦 Товар: {data['item']}\n"
+
+        f"🕐 Время: {data['delivery_time']}\n"
+
+        f"📝 Комментарий: {data['comment']}\n\n"
+
+        "Создать заказ?",
+
+        reply_markup=order_confirm_keyboard,
+
+    )
+
+@dp.message(
+
+    OrderCreation.confirm,
+
+    F.text == "✅ Создать заказ"
+
+)
+
+async def order_confirm(message: Message, state: FSMContext):
+
+    data = await state.get_data()
+
+    async with db_pool.acquire() as conn:
+
+        store = await conn.fetchrow(
+
+            """
+
+            SELECT id, address
+
+            FROM stores
+
+            WHERE telegram_id = $1
+
+              AND status = 'approved'
+
+            """,
+
+            message.from_user.id,
+
+        )
+
+        if not store:
+
+            await state.clear()
+
+            await message.answer(
+
+                "❌ Магазин не найден или не одобрен.",
+
+                reply_markup=main_keyboard,
+
+            )
+
+            return
+
+        order_id = await conn.fetchval(
+
+            """
+
+            INSERT INTO orders (
+
+                store_id,
+
+                client_name,
+
+                client_phone,
+
+                pickup_address,
+
+                delivery_address,
+
+                item,
+
+                delivery_time,
+
+                comment
+
+            )
+
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+
+            RETURNING id
+
+            """,
+
+            store["id"],
+
+            data["client_name"],
+
+            data["client_phone"],
+
+            store["address"],
+
+            data["delivery_address"],
+
+            data["item"],
+
+            data["delivery_time"],
+
+            data["comment"],
+
+        )
+
+    await state.clear()
+
+    await message.answer(
+
+        f"✅ Заказ №{order_id} создан!\n\n"
+
+        "Статус: 🆕 Новый\n\n"
+
+        "Теперь заказ доступен администратору.",
+
+        reply_markup=store_keyboard,
+
+    )
+
+@dp.message(
+
+    OrderCreation.confirm,
+
+    F.text == "❌ Отменить заказ"
+
+)
+
+async def order_cancel(message: Message, state: FSMContext):
+
+    await state.clear()
+
+    await message.answer(
+
+        "❌ Создание заказа отменено.",
+
+        reply_markup=store_keyboard,
+
+    )
+
+# =========================
+
+# МОИ ЗАКАЗЫ
+
+# =========================
+
+@dp.message(F.text == "📦 Мои заказы")
+
+async def my_orders(message: Message):
+
+    async with db_pool.acquire() as conn:
+
+        orders = await conn.fetch(
+
+            """
+
+            SELECT
+
+                o.id,
+
+                o.client_name,
+
+                o.delivery_address,
+
+                o.item,
+
+                o.status,
+
+                o.created_at
+
+            FROM orders o
+
+            JOIN stores s ON s.id = o.store_id
+
+            WHERE s.telegram_id = $1
+
+            ORDER BY o.id DESC
+
+            LIMIT 10
+
+            """,
+
+            message.from_user.id,
+
+        )
+
+    if not orders:
+
+        await message.answer(
+
+            "📦 У вас пока нет заказов."
+
+        )
+
+        return
+
+    status_map = {
+
+        "new": "🆕 Новый",
+
+        "assigned": "🚚 Назначен курьер",
+
+        "picked_up": "📦 Забран",
+
+        "on_the_way": "🚗 В пути",
+
+        "arrived": "📍 Курьер прибыл",
+
+        "delivered": "✅ Доставлен",
+
+        "problem": "🚨 Проблема",
+
+        "cancelled": "❌ Отменён",
+
+    }
+
+    text = "📦 ВАШИ ПОСЛЕДНИЕ ЗАКАЗЫ\n\n"
+
+    for order in orders:
+
+        text += (
+
+            f"№{order['id']} — "
+
+            f"{status_map.get(order['status'], order['status'])}\n"
+
+            f"👤 {order['client_name']}\n"
+
+            f"📍 {order['delivery_address']}\n"
+
+            f"📦 {order['item']}\n\n"
+
+        )
+
+    await message.answer(text)
+
+# =========================
+
+# АДМИНИСТРАТОР
+
+# =========================
 
 @dp.message(F.text == "👨‍💼 Администратор")
 
@@ -388,23 +1020,49 @@ async def admin_handler(message: Message):
 
         )
 
-    if not stores:
+        new_orders = await conn.fetch(
 
-        await message.answer(
+            """
 
-            "👨‍💼 Администратор\n\n"
+            SELECT
 
-            "Новых заявок магазинов нет."
+                o.id,
+
+                o.client_name,
+
+                o.client_phone,
+
+                o.pickup_address,
+
+                o.delivery_address,
+
+                o.item,
+
+                o.delivery_time,
+
+                o.comment,
+
+                s.store_name
+
+            FROM orders o
+
+            JOIN stores s ON s.id = o.store_id
+
+            WHERE o.status = 'new'
+
+            ORDER BY o.created_at ASC
+
+            """
 
         )
 
-        return
-
     await message.answer(
 
-        f"👨‍💼 Администратор\n\n"
+        "👨‍💼 АДМИНИСТРАТОР\n\n"
 
-        f"Новых заявок: {len(stores)}"
+        f"🏪 Новых заявок магазинов: {len(stores)}\n"
+
+        f"📦 Новых заказов: {len(new_orders)}"
 
     )
 
@@ -451,6 +1109,30 @@ async def admin_handler(message: Message):
             f"📍 Адрес: {store['address']}",
 
             reply_markup=keyboard,
+
+        )
+
+    for order in new_orders:
+
+        await message.answer(
+
+            f"🆕 НОВЫЙ ЗАКАЗ №{order['id']}\n\n"
+
+            f"🏪 Магазин: {order['store_name']}\n"
+
+            f"📍 Забрать: {order['pickup_address']}\n\n"
+
+            f"👤 Клиент: {order['client_name']}\n"
+
+            f"📞 {order['client_phone']}\n"
+
+            f"📍 Доставить: {order['delivery_address']}\n\n"
+
+            f"📦 {order['item']}\n"
+
+            f"🕐 {order['delivery_time']}\n"
+
+            f"📝 {order['comment']}"
 
         )
 
@@ -560,9 +1242,7 @@ async def reject_store_handler(callback: CallbackQuery):
 
             store["telegram_id"],
 
-            "❌ Ваша заявка магазина была отклонена.\n\n"
-
-            "Для уточнения свяжитесь с администратором.",
+            "❌ Ваша заявка магазина была отклонена."
 
         )
 
@@ -572,6 +1252,12 @@ async def reject_store_handler(callback: CallbackQuery):
 
     await callback.answer("Заявка отклонена.")
 
+# =========================
+
+# КУРЬЕР
+
+# =========================
+
 @dp.message(F.text == "🚚 Курьер")
 
 async def courier_handler(message: Message):
@@ -580,9 +1266,17 @@ async def courier_handler(message: Message):
 
         "🚚 Раздел курьера.\n\n"
 
-        "Регистрацию курьера добавим следующим этапом."
+        "Регистрацию и назначение заказов курьеру "
+
+        "добавим следующим этапом."
 
     )
+
+# =========================
+
+# FALLBACK
+
+# =========================
 
 @dp.message()
 
@@ -593,6 +1287,12 @@ async def fallback_handler(message: Message):
         "Пожалуйста, используйте кнопки меню."
 
     )
+
+# =========================
+
+# RUN
+
+# =========================
 
 async def main():
 
