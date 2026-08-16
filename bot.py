@@ -2140,12 +2140,66 @@ async def order_item(
     )
 
     await state.set_state(
+        OrderCreation.kittek_order_number
+    )
+
+    await message.answer(
+        "🔢 Введите номер заказа по Kittek.\n\n"
+        "Если номера нет — нажмите «⏭ Пропустить».",
+        reply_markup=skip_keyboard,
+    )
+
+@dp.message(OrderCreation.kittek_order_number)
+async def order_kittek_number(
+    message: Message,
+    state: FSMContext,
+):
+
+    value = None
+
+    if message.text != "⏭ Пропустить":
+        value = message.text
+
+    await state.update_data(
+        kittek_order_number=value
+    )
+
+    await state.set_state(
+        OrderCreation.kaspi_order_number
+    )
+
+    await message.answer(
+        "🛒 Введите номер заказа по Kaspi.\n\n"
+        "Если номера нет — нажмите «⏭ Пропустить».",
+        reply_markup=skip_keyboard,
+    )
+
+
+@dp.message(OrderCreation.kaspi_order_number)
+async def order_kaspi_number(
+    message: Message,
+    state: FSMContext,
+):
+
+    value = None
+
+    if message.text != "⏭ Пропустить":
+        value = message.text
+
+    await state.update_data(
+        kaspi_order_number=value
+    )
+
+    await state.set_state(
         OrderCreation.delivery_time
     )
 
     await message.answer(
-        "🕐 Укажите желаемое "
-        "время доставки:"
+        "🕐 Укажите желаемое время доставки:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[],
+            resize_keyboard=True,
+        ),
     )
 
 
