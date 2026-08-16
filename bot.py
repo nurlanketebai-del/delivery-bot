@@ -87,12 +87,13 @@ class CourierRegistration(StatesGroup):
     vehicle = State()
     confirm = State()
 
-
 class OrderCreation(StatesGroup):
     client_name = State()
     client_phone = State()
     delivery_address = State()
     item = State()
+    kittek_order_number = State()
+    kaspi_order_number = State()
     delivery_time = State()
     comment = State()
     confirm = State()
@@ -798,6 +799,12 @@ courier_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+ skip_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="⏭ Пропустить")],
+    ],
+    resize_keyboard=True,
+)       
 
 registration_confirm_keyboard = ReplyKeyboardMarkup(
     keyboard=[
