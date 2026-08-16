@@ -251,6 +251,19 @@ async def init_db():
             NOT NULL DEFAULT 0
             """
         )
+        await conn.execute(
+    """
+    ALTER TABLE orders
+    ADD COLUMN IF NOT EXISTS kittek_order_number TEXT
+    """
+)
+
+await conn.execute(
+    """
+    ALTER TABLE orders
+    ADD COLUMN IF NOT EXISTS kaspi_order_number TEXT
+    """
+)
 
         await conn.execute(
             """
