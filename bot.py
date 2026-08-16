@@ -257,9 +257,9 @@ async def init_db():
     ALTER TABLE orders
     ADD COLUMN IF NOT EXISTS kittek_order_number TEXT
     """
-)
+    )
 
-await conn.execute(
+        await conn.execute(
     """
     ALTER TABLE orders
     ADD COLUMN IF NOT EXISTS kaspi_order_number TEXT
