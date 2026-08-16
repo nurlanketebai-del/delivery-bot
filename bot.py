@@ -929,6 +929,7 @@ async def managers_handler(message: Message):
         members = await conn.fetch(
             """
             SELECT
+                id,
                 full_name,
                 telegram_id,
                 member_role
@@ -953,31 +954,50 @@ async def managers_handler(message: Message):
         f"🏪 {membership['store_name']}\n\n"
     )
 
+    buttons = []
+
     for member in members:
 
         if member["member_role"] == "owner":
-            role_text = "👑 Владелец"
-        else:
-            role_text = "👤 Менеджер"
+            text += (
+                f"👑 Владелец: "
+                f"{member['full_name']}\n"
+            )
 
-        text += (
-            f"{role_text}: "
-            f"{member['full_name']}\n"
-        )
+        else:
+            text += (
+                f"👤 Менеджер: "
+                f"{member['full_name']}\n"
+            )
+
+            # Удалять менеджеров может только владелец
+            if membership["member_role"] == "owner":
+
+                buttons.append([
+                    InlineKeyboardButton(
+                        text=f"❌ Удалить {member['full_name']}",
+                        callback_data=(
+                            f"remove_manager:"
+                            f"{member['telegram_id']}"
+                        ),
+                    )
+                ])
+
+    # Кнопка приглашения доступна только владельцу
+    if membership["member_role"] == "owner":
+
+        buttons.append([
+            InlineKeyboardButton(
+                text="➕ Пригласить менеджера",
+                callback_data="create_manager_invite",
+            )
+        ])
 
     keyboard = None
 
-    if membership["member_role"] == "owner":
-
+    if buttons:
         keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="➕ Пригласить менеджера",
-                        callback_data="create_manager_invite",
-                    )
-                ]
-            ]
+            inline_keyboard=buttons
         )
 
     await message.answer(
@@ -985,6 +1005,232 @@ async def managers_handler(message: Message):
         reply_markup=keyboard,
     )
 
+
+# =========================================================
+# УДАЛЕНИЕ МЕНЕДЖЕРА
+# =========================================================
+
+@dp.callback_query(
+    F.data.startswith("remove_manager:")
+)
+async def remove_manager_confirm(
+    callback: CallbackQuery
+):
+
+    membership = await get_store_membership(
+        callback.from_user.id
+    )
+
+    if (
+        not membership
+        or membership["member_role"] != "owner"
+        or membership["status"] != "approved"
+    ):
+        await callback.answer(
+            "❌ Только владелец магазина "
+            "может удалять менеджеров.",
+            show_alert=True,
+        )
+        return
+
+    manager_telegram_id = int(
+        callback.data.split(":")[1]
+    )
+
+    async with db_pool.acquire() as conn:
+
+        manager = await conn.fetchrow(
+            """
+            SELECT
+                full_name,
+                telegram_id,
+                member_role
+
+            FROM store_users
+
+            WHERE store_id = $1
+              AND telegram_id = $2
+            """,
+            membership["store_id"],
+            manager_telegram_id,
+        )
+
+    if not manager:
+        await callback.answer(
+            "Менеджер не найден.",
+            show_alert=True,
+        )
+        return
+
+    if manager["member_role"] == "owner":
+        await callback.answer(
+            "❌ Владельца магазина удалить нельзя.",
+            show_alert=True,
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Да, удалить",
+                    callback_data=(
+                        f"confirm_remove_manager:"
+                        f"{manager_telegram_id}"
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text="↩️ Отмена",
+                    callback_data="cancel_remove_manager",
+                ),
+            ]
+        ]
+    )
+
+    await callback.message.answer(
+        "⚠️ УДАЛЕНИЕ МЕНЕДЖЕРА\n\n"
+        f"👤 {manager['full_name']}\n\n"
+        "После удаления этот пользователь "
+        "потеряет доступ к магазину.\n\n"
+        "Удалить менеджера?",
+        reply_markup=keyboard,
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ
+# =========================================================
+
+@dp.callback_query(
+    F.data.startswith("confirm_remove_manager:")
+)
+async def confirm_remove_manager(
+    callback: CallbackQuery
+):
+
+    membership = await get_store_membership(
+        callback.from_user.id
+    )
+
+    if (
+        not membership
+        or membership["member_role"] != "owner"
+        or membership["status"] != "approved"
+    ):
+        await callback.answer(
+            "❌ Нет доступа.",
+            show_alert=True,
+        )
+        return
+
+    manager_telegram_id = int(
+        callback.data.split(":")[1]
+    )
+
+    async with db_pool.acquire() as conn:
+
+        manager = await conn.fetchrow(
+            """
+            SELECT
+                full_name,
+                telegram_id,
+                member_role
+
+            FROM store_users
+
+            WHERE store_id = $1
+              AND telegram_id = $2
+            """,
+            membership["store_id"],
+            manager_telegram_id,
+        )
+
+        if not manager:
+            await callback.answer(
+                "Менеджер уже удалён.",
+                show_alert=True,
+            )
+            return
+
+        if manager["member_role"] == "owner":
+            await callback.answer(
+                "❌ Владельца удалить нельзя.",
+                show_alert=True,
+            )
+            return
+
+        await conn.execute(
+            """
+            DELETE FROM store_users
+
+            WHERE store_id = $1
+              AND telegram_id = $2
+              AND member_role = 'manager'
+            """,
+            membership["store_id"],
+            manager_telegram_id,
+        )
+
+    await callback.message.edit_reply_markup(
+        reply_markup=None
+    )
+
+    await callback.message.answer(
+        f"✅ Менеджер {manager['full_name']} удалён "
+        f"из магазина {membership['store_name']}."
+    )
+
+    # Сообщаем удалённому менеджеру
+    try:
+        role, _ = await get_user_role(
+            manager_telegram_id
+        )
+
+        await bot.send_message(
+            manager_telegram_id,
+            f"ℹ️ Вы больше не являетесь менеджером "
+            f"магазина {membership['store_name']}.",
+            reply_markup=main_keyboard(
+                role,
+                manager_telegram_id,
+            ),
+        )
+
+    except Exception:
+        pass
+
+    await callback.answer(
+        "Менеджер удалён."
+    )
+
+
+# =========================================================
+# ОТМЕНА УДАЛЕНИЯ
+# =========================================================
+
+@dp.callback_query(
+    F.data == "cancel_remove_manager"
+)
+async def cancel_remove_manager(
+    callback: CallbackQuery
+):
+
+    await callback.message.edit_reply_markup(
+        reply_markup=None
+    )
+
+    await callback.message.answer(
+        "Удаление менеджера отменено."
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# СОЗДАНИЕ ПРИГЛАШЕНИЯ
+# =========================================================
 
 @dp.callback_query(
     F.data == "create_manager_invite"
@@ -1074,8 +1320,6 @@ async def create_manager_invite(
         "🔑 Присоединиться к магазину\n\n"
         "⚠️ Код одноразовый."
     )
-
-
 # =========================================================
 # ПРОФИЛЬ МАГАЗИНА
 # =========================================================
