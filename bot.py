@@ -38,6 +38,7 @@ if not TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
+
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 db_pool = None
@@ -74,6 +75,10 @@ class OrderCreation(StatesGroup):
     delivery_time = State()
     comment = State()
     confirm = State()
+
+
+class OrderEdit(StatesGroup):
+    value = State()
 
 
 class CourierPhoto(StatesGroup):
@@ -291,7 +296,6 @@ async def deny_admin_message(message: Message):
             "Этот раздел доступен только администратору."
         )
         return True
-
     return False
 
 
@@ -302,7 +306,6 @@ async def deny_admin_callback(callback: CallbackQuery):
             show_alert=True,
         )
         return True
-
     return False
 
 
@@ -320,12 +323,10 @@ def main_keyboard(role, user_id: int):
         rows.append([KeyboardButton(text="🚚 Курьер")])
 
     else:
-        rows.append(
-            [
-                KeyboardButton(text="🏪 Магазин"),
-                KeyboardButton(text="🚚 Курьер"),
-            ]
-        )
+        rows.append([
+            KeyboardButton(text="🏪 Магазин"),
+            KeyboardButton(text="🚚 Курьер"),
+        ])
 
     if is_admin(user_id):
         rows.append(
@@ -408,7 +409,9 @@ admin_keyboard = ReplyKeyboardMarkup(
 
 
 async def send_main_menu(message: Message):
-    role, _ = await get_user_role(message.from_user.id)
+    role, _ = await get_user_role(
+        message.from_user.id
+    )
 
     await message.answer(
         "Главное меню:",
@@ -424,7 +427,10 @@ async def send_main_menu(message: Message):
 # =========================================================
 
 @dp.message(CommandStart())
-async def start_handler(message: Message, state: FSMContext):
+async def start_handler(
+    message: Message,
+    state: FSMContext,
+):
     await state.clear()
 
     role, info = await get_user_role(
@@ -466,7 +472,10 @@ async def myid_handler(message: Message):
 
 
 @dp.message(F.text == "⬅️ Главное меню")
-async def back_main(message: Message, state: FSMContext):
+async def back_main(
+    message: Message,
+    state: FSMContext,
+):
     await state.clear()
     await send_main_menu(message)
 
@@ -476,8 +485,10 @@ async def back_main(message: Message, state: FSMContext):
 # =========================================================
 
 @dp.message(F.text == "🏪 Магазин")
-async def store_section(message: Message, state: FSMContext):
-
+async def store_section(
+    message: Message,
+    state: FSMContext,
+):
     role, info = await get_user_role(
         message.from_user.id
     )
@@ -524,7 +535,6 @@ async def register_store_start(
     message: Message,
     state: FSMContext,
 ):
-
     role, _ = await get_user_role(
         message.from_user.id
     )
@@ -633,7 +643,6 @@ async def register_store_confirm(
     message: Message,
     state: FSMContext,
 ):
-
     role, _ = await get_user_role(
         message.from_user.id
     )
@@ -661,20 +670,16 @@ async def register_store_confirm(
                     address,
                     status
                 )
-
                 VALUES (
                     $1,$2,$3,$4,$5,'pending'
                 )
-
                 ON CONFLICT (telegram_id)
-
                 DO UPDATE SET
                     store_name = EXCLUDED.store_name,
                     contact_name = EXCLUDED.contact_name,
                     phone = EXCLUDED.phone,
                     address = EXCLUDED.address,
                     status = 'pending'
-
                 RETURNING id
                 """,
                 message.from_user.id,
@@ -692,13 +697,10 @@ async def register_store_confirm(
                     full_name,
                     member_role
                 )
-
                 VALUES (
                     $1,$2,$3,'owner'
                 )
-
                 ON CONFLICT (telegram_id)
-
                 DO UPDATE SET
                     store_id = EXCLUDED.store_id,
                     full_name = EXCLUDED.full_name,
@@ -728,7 +730,6 @@ async def join_store_start(
     message: Message,
     state: FSMContext,
 ):
-
     role, _ = await get_user_role(
         message.from_user.id
     )
@@ -753,7 +754,6 @@ async def join_store_code(
     message: Message,
     state: FSMContext,
 ):
-
     code = (message.text or "").strip().upper()
 
     role, _ = await get_user_role(
@@ -778,15 +778,11 @@ async def join_store_code(
                     si.store_id,
                     s.store_name,
                     s.status
-
                 FROM store_invites si
-
                 JOIN stores s
                     ON s.id = si.store_id
-
                 WHERE si.code = $1
                   AND si.is_active = TRUE
-
                 FOR UPDATE
                 """,
                 code,
@@ -812,13 +808,10 @@ async def join_store_code(
                     full_name,
                     member_role
                 )
-
                 VALUES (
                     $1,$2,$3,'manager'
                 )
-
                 ON CONFLICT (telegram_id)
-
                 DO UPDATE SET
                     store_id = EXCLUDED.store_id,
                     full_name = EXCLUDED.full_name,
@@ -832,12 +825,10 @@ async def join_store_code(
             await conn.execute(
                 """
                 UPDATE store_invites
-
                 SET
                     is_active = FALSE,
                     used_by = $1,
                     used_at = NOW()
-
                 WHERE id = $2
                 """,
                 message.from_user.id,
@@ -886,11 +877,8 @@ async def managers_handler(message: Message):
                 full_name,
                 telegram_id,
                 member_role
-
             FROM store_users
-
             WHERE store_id = $1
-
             ORDER BY
                 CASE
                     WHEN member_role = 'owner'
@@ -916,7 +904,6 @@ async def managers_handler(message: Message):
                 f"👑 Владелец: "
                 f"{member['full_name']}\n"
             )
-
         else:
             text += (
                 f"👤 Менеджер: "
@@ -961,7 +948,6 @@ async def managers_handler(message: Message):
 async def remove_manager_confirm(
     callback: CallbackQuery
 ):
-
     membership = await get_store_membership(
         callback.from_user.id
     )
@@ -989,9 +975,7 @@ async def remove_manager_confirm(
                 full_name,
                 telegram_id,
                 member_role
-
             FROM store_users
-
             WHERE store_id = $1
               AND telegram_id = $2
             """,
@@ -1049,7 +1033,6 @@ async def remove_manager_confirm(
 async def confirm_remove_manager(
     callback: CallbackQuery
 ):
-
     membership = await get_store_membership(
         callback.from_user.id
     )
@@ -1077,9 +1060,7 @@ async def confirm_remove_manager(
                 full_name,
                 telegram_id,
                 member_role
-
             FROM store_users
-
             WHERE store_id = $1
               AND telegram_id = $2
             """,
@@ -1104,7 +1085,6 @@ async def confirm_remove_manager(
         await conn.execute(
             """
             DELETE FROM store_users
-
             WHERE store_id = $1
               AND telegram_id = $2
               AND member_role = 'manager'
@@ -1149,7 +1129,6 @@ async def confirm_remove_manager(
 async def cancel_remove_manager(
     callback: CallbackQuery
 ):
-
     await callback.message.edit_reply_markup(
         reply_markup=None
     )
@@ -1167,7 +1146,6 @@ async def cancel_remove_manager(
 async def create_manager_invite(
     callback: CallbackQuery,
 ):
-
     membership = await get_store_membership(
         callback.from_user.id
     )
@@ -1184,17 +1162,13 @@ async def create_manager_invite(
         )
         return
 
-    alphabet = (
-        string.ascii_uppercase
-        + string.digits
-    )
+    alphabet = string.ascii_uppercase + string.digits
 
     async with db_pool.acquire() as conn:
 
         code = None
 
         for _ in range(30):
-
             candidate = "".join(
                 secrets.choice(alphabet)
                 for _ in range(6)
@@ -1229,7 +1203,6 @@ async def create_manager_invite(
                 code,
                 created_by
             )
-
             VALUES ($1,$2,$3)
             """,
             membership["store_id"],
@@ -1294,7 +1267,6 @@ async def order_start(
     message: Message,
     state: FSMContext,
 ):
-
     membership = await get_store_membership(
         message.from_user.id
     )
@@ -1310,7 +1282,6 @@ async def order_start(
         return
 
     await state.clear()
-
     await state.set_state(
         OrderCreation.client_name
     )
@@ -1417,7 +1388,6 @@ async def order_comment(
     message: Message,
     state: FSMContext,
 ):
-
     await state.update_data(
         comment=message.text
     )
@@ -1430,7 +1400,6 @@ async def order_comment(
 
     if not membership:
         await state.clear()
-
         await message.answer(
             "❌ Магазин не найден."
         )
@@ -1464,7 +1433,6 @@ async def order_confirm(
     message: Message,
     state: FSMContext,
 ):
-
     data = await state.get_data()
 
     membership = await get_store_membership(
@@ -1476,7 +1444,6 @@ async def order_confirm(
         or membership["status"] != "approved"
     ):
         await state.clear()
-
         await message.answer(
             "❌ Магазин недоступен."
         )
@@ -1497,11 +1464,9 @@ async def order_confirm(
                 comment,
                 created_by_telegram_id
             )
-
             VALUES (
                 $1,$2,$3,$4,$5,$6,$7,$8,$9
             )
-
             RETURNING id
             """,
             membership["store_id"],
@@ -1532,7 +1497,6 @@ async def order_cancel(
     message: Message,
     state: FSMContext,
 ):
-
     await state.clear()
 
     await message.answer(
@@ -1543,6 +1507,7 @@ async def order_cancel(
 
 # =========================================================
 # ЗАКАЗЫ МАГАЗИНА
+# + РЕДАКТИРОВАНИЕ
 # =========================================================
 
 @dp.message(F.text == "📦 Мои заказы")
@@ -1568,17 +1533,15 @@ async def store_orders(message: Message):
                 o.client_phone,
                 o.delivery_address,
                 o.item,
+                o.delivery_time,
+                o.comment,
                 o.status,
                 su.full_name AS created_by
-
             FROM orders o
-
             LEFT JOIN store_users su
                 ON su.telegram_id =
                    o.created_by_telegram_id
-
             WHERE o.store_id = $1
-
             ORDER BY o.id DESC
             LIMIT 20
             """,
@@ -1604,7 +1567,9 @@ async def store_orders(message: Message):
         "cancelled": "❌ Отменён",
     }
 
-    text = "📦 ЗАКАЗЫ МАГАЗИНА\n\n"
+    await message.answer(
+        f"📦 ЗАКАЗЫ МАГАЗИНА: {len(orders)}"
+    )
 
     for order in orders:
 
@@ -1613,17 +1578,319 @@ async def store_orders(message: Message):
             or "Старый заказ"
         )
 
-        text += (
-            f"№{order['id']} — "
+        keyboard = None
+
+        if order["status"] == "new":
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="✏️ Редактировать",
+                            callback_data=f"edit_order:{order['id']}",
+                        )
+                    ]
+                ]
+            )
+
+        await message.answer(
+            f"📦 ЗАКАЗ №{order['id']}\n\n"
+            f"Статус: "
             f"{status_map.get(order['status'], order['status'])}\n"
-            f"👤 Создал: {author}\n"
+            f"👤 Создал: {author}\n\n"
             f"👤 Клиент: {order['client_name']}\n"
             f"📞 {order['client_phone']}\n"
             f"📍 {order['delivery_address']}\n"
-            f"📦 {order['item']}\n\n"
+            f"📦 {order['item']}\n"
+            f"🕐 {order['delivery_time']}\n"
+            f"📝 {order['comment']}",
+            reply_markup=keyboard,
         )
 
-    await message.answer(text)
+
+# =========================================================
+# ОТКРЫТЬ РЕДАКТИРОВАНИЕ
+# =========================================================
+
+@dp.callback_query(
+    F.data.startswith("edit_order:")
+)
+async def edit_order_menu(
+    callback: CallbackQuery,
+):
+
+    order_id = int(
+        callback.data.split(":")[1]
+    )
+
+    membership = await get_store_membership(
+        callback.from_user.id
+    )
+
+    if not membership:
+        await callback.answer(
+            "Магазин не найден.",
+            show_alert=True,
+        )
+        return
+
+    async with db_pool.acquire() as conn:
+
+        order = await conn.fetchrow(
+            """
+            SELECT *
+            FROM orders
+
+            WHERE id = $1
+              AND store_id = $2
+            """,
+            order_id,
+            membership["store_id"],
+        )
+
+    if not order:
+        await callback.answer(
+            "Заказ не найден.",
+            show_alert=True,
+        )
+        return
+
+    if order["status"] != "new":
+        await callback.answer(
+            "❌ Заказ уже назначен курьеру. "
+            "Редактирование заблокировано.",
+            show_alert=True,
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="👤 Имя клиента",
+                    callback_data=f"edit_field:{order_id}:client_name",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📞 Телефон",
+                    callback_data=f"edit_field:{order_id}:client_phone",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📍 Адрес доставки",
+                    callback_data=f"edit_field:{order_id}:delivery_address",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📦 Товар",
+                    callback_data=f"edit_field:{order_id}:item",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🕐 Время",
+                    callback_data=f"edit_field:{order_id}:delivery_time",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📝 Комментарий",
+                    callback_data=f"edit_field:{order_id}:comment",
+                )
+            ],
+        ]
+    )
+
+    await callback.message.answer(
+        f"✏️ РЕДАКТИРОВАНИЕ ЗАКАЗА №{order_id}\n\n"
+        f"👤 {order['client_name']}\n"
+        f"📞 {order['client_phone']}\n"
+        f"📍 {order['delivery_address']}\n"
+        f"📦 {order['item']}\n"
+        f"🕐 {order['delivery_time']}\n"
+        f"📝 {order['comment']}\n\n"
+        "Что хотите изменить?",
+        reply_markup=keyboard,
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# ВЫБОР ПОЛЯ
+# =========================================================
+
+@dp.callback_query(
+    F.data.startswith("edit_field:")
+)
+async def edit_order_field(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    parts = callback.data.split(":")
+
+    order_id = int(parts[1])
+    field = parts[2]
+
+    field_names = {
+        "client_name": "имя клиента",
+        "client_phone": "номер телефона",
+        "delivery_address": "адрес доставки",
+        "item": "товар",
+        "delivery_time": "время доставки",
+        "comment": "комментарий",
+    }
+
+    if field not in field_names:
+        await callback.answer(
+            "Неизвестное поле.",
+            show_alert=True,
+        )
+        return
+
+    membership = await get_store_membership(
+        callback.from_user.id
+    )
+
+    if not membership:
+        await callback.answer(
+            "Магазин не найден.",
+            show_alert=True,
+        )
+        return
+
+    async with db_pool.acquire() as conn:
+
+        valid = await conn.fetchval(
+            """
+            SELECT EXISTS(
+                SELECT 1
+                FROM orders
+                WHERE id = $1
+                  AND store_id = $2
+                  AND status = 'new'
+            )
+            """,
+            order_id,
+            membership["store_id"],
+        )
+
+    if not valid:
+        await callback.answer(
+            "❌ Заказ уже нельзя редактировать.",
+            show_alert=True,
+        )
+        return
+
+    await state.update_data(
+        edit_order_id=order_id,
+        edit_field=field,
+    )
+
+    await state.set_state(
+        OrderEdit.value
+    )
+
+    await callback.message.answer(
+        f"✏️ Заказ №{order_id}\n\n"
+        f"Введите новое {field_names[field]}:"
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# СОХРАНИТЬ ИЗМЕНЕНИЕ
+# =========================================================
+
+@dp.message(OrderEdit.value)
+async def save_order_edit(
+    message: Message,
+    state: FSMContext,
+):
+
+    value = (message.text or "").strip()
+
+    if not value:
+        await message.answer(
+            "❌ Значение не может быть пустым."
+        )
+        return
+
+    data = await state.get_data()
+
+    order_id = data.get("edit_order_id")
+    field = data.get("edit_field")
+
+    allowed_fields = {
+        "client_name",
+        "client_phone",
+        "delivery_address",
+        "item",
+        "delivery_time",
+        "comment",
+    }
+
+    if (
+        not order_id
+        or field not in allowed_fields
+    ):
+        await state.clear()
+
+        await message.answer(
+            "❌ Ошибка редактирования."
+        )
+        return
+
+    membership = await get_store_membership(
+        message.from_user.id
+    )
+
+    if not membership:
+        await state.clear()
+
+        await message.answer(
+            "❌ Магазин не найден."
+        )
+        return
+
+    async with db_pool.acquire() as conn:
+
+        order = await conn.fetchrow(
+            f"""
+            UPDATE orders
+
+            SET {field} = $1
+
+            WHERE id = $2
+              AND store_id = $3
+              AND status = 'new'
+
+            RETURNING id
+            """,
+            value,
+            order_id,
+            membership["store_id"],
+        )
+
+    await state.clear()
+
+    if not order:
+        await message.answer(
+            "❌ Заказ уже был назначен курьеру.\n"
+            "Редактирование заблокировано."
+        )
+        return
+
+    await message.answer(
+        f"✅ Заказ №{order_id} обновлён.\n\n"
+        "Откройте «📦 Мои заказы», "
+        "чтобы проверить изменения.",
+        reply_markup=store_keyboard,
+    )
 
 
 # =========================================================
@@ -1635,7 +1902,6 @@ async def courier_section(
     message: Message,
     state: FSMContext,
 ):
-
     role, info = await get_user_role(
         message.from_user.id
     )
@@ -1679,7 +1945,6 @@ async def courier_name(
     message: Message,
     state: FSMContext,
 ):
-
     await state.update_data(
         full_name=message.text
     )
@@ -1698,7 +1963,6 @@ async def courier_phone(
     message: Message,
     state: FSMContext,
 ):
-
     await state.update_data(
         phone=message.text
     )
@@ -1717,7 +1981,6 @@ async def courier_vehicle(
     message: Message,
     state: FSMContext,
 ):
-
     await state.update_data(
         vehicle=message.text
     )
@@ -1746,7 +2009,6 @@ async def courier_confirm(
     message: Message,
     state: FSMContext,
 ):
-
     role, _ = await get_user_role(
         message.from_user.id
     )
@@ -1772,13 +2034,10 @@ async def courier_confirm(
                 vehicle,
                 status
             )
-
             VALUES (
                 $1,$2,$3,$4,'pending'
             )
-
             ON CONFLICT (telegram_id)
-
             DO UPDATE SET
                 full_name = EXCLUDED.full_name,
                 phone = EXCLUDED.phone,
@@ -1849,22 +2108,17 @@ async def courier_orders(message: Message):
                 o.*,
                 s.store_name,
                 su.full_name AS created_by
-
             FROM orders o
-
             JOIN stores s
                 ON s.id = o.store_id
-
             LEFT JOIN store_users su
                 ON su.telegram_id =
                    o.created_by_telegram_id
-
             WHERE o.courier_id = $1
               AND o.status NOT IN (
                   'delivered',
                   'cancelled'
               )
-
             ORDER BY o.id DESC
             """,
             courier_id,
@@ -2000,7 +2254,6 @@ async def accept_order(callback: CallbackQuery):
             """
             UPDATE orders
             SET status = 'accepted'
-
             WHERE id = $1
               AND courier_id = $2
               AND status = 'assigned'
@@ -2032,7 +2285,6 @@ async def pickup_photo_request(
     callback: CallbackQuery,
     state: FSMContext,
 ):
-
     order_id = int(
         callback.data.split(":")[1]
     )
@@ -2061,7 +2313,6 @@ async def pickup_photo_received(
     message: Message,
     state: FSMContext,
 ):
-
     data = await state.get_data()
     order_id = data["order_id"]
 
@@ -2080,7 +2331,6 @@ async def pickup_photo_received(
             SELECT EXISTS(
                 SELECT 1
                 FROM orders
-
                 WHERE id = $1
                   AND courier_id = $2
                   AND status = 'accepted'
@@ -2108,7 +2358,6 @@ async def pickup_photo_received(
                 photo_type,
                 file_id
             )
-
             VALUES (
                 $1,$2,'pickup',$3
             )
@@ -2161,7 +2410,6 @@ async def picked_up(callback: CallbackQuery):
             """
             UPDATE orders
             SET status = 'picked_up'
-
             WHERE id = $1
               AND courier_id = $2
               AND status = 'pickup_photo'
@@ -2208,7 +2456,6 @@ async def on_way(callback: CallbackQuery):
             """
             UPDATE orders
             SET status = 'on_the_way'
-
             WHERE id = $1
               AND courier_id = $2
               AND status = 'picked_up'
@@ -2255,7 +2502,6 @@ async def arrived(callback: CallbackQuery):
             """
             UPDATE orders
             SET status = 'arrived'
-
             WHERE id = $1
               AND courier_id = $2
               AND status = 'on_the_way'
@@ -2287,7 +2533,6 @@ async def delivery_photo_request(
     callback: CallbackQuery,
     state: FSMContext,
 ):
-
     order_id = int(
         callback.data.split(":")[1]
     )
@@ -2316,7 +2561,6 @@ async def delivery_photo_received(
     message: Message,
     state: FSMContext,
 ):
-
     data = await state.get_data()
     order_id = data["order_id"]
 
@@ -2335,7 +2579,6 @@ async def delivery_photo_received(
             SELECT EXISTS(
                 SELECT 1
                 FROM orders
-
                 WHERE id = $1
                   AND courier_id = $2
                   AND status = 'arrived'
@@ -2363,7 +2606,6 @@ async def delivery_photo_received(
                 photo_type,
                 file_id
             )
-
             VALUES (
                 $1,$2,'delivery',$3
             )
@@ -2415,13 +2657,10 @@ async def delivered(callback: CallbackQuery):
         order = await conn.fetchrow(
             """
             UPDATE orders
-
             SET status = 'delivered'
-
             WHERE id = $1
               AND courier_id = $2
               AND status = 'delivery_photo'
-
             RETURNING store_id
             """,
             order_id,
@@ -2506,17 +2745,35 @@ async def admin_home(message: Message):
             """
         )
 
+        pending_stores = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM stores
+            WHERE status = 'pending'
+            """
+        )
+
+        pending_couriers = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM couriers
+            WHERE status = 'pending'
+            """
+        )
+
     await message.answer(
         "👨‍💼 АДМИН-ПАНЕЛЬ\n\n"
         f"📦 Новых заказов: {new_orders}\n"
         f"🚚 Активных заказов: {active_orders}\n"
-        f"✅ Доставленных: {delivered_orders}",
+        f"✅ Доставленных: {delivered_orders}\n\n"
+        f"🏪 Заявок магазинов: {pending_stores}\n"
+        f"🚚 Заявок курьеров: {pending_couriers}",
         reply_markup=admin_keyboard,
     )
 
 
 # =========================================================
-# АДМИН — НОВЫЕ ЗАКАЗЫ
+# АДМИН — НОВЫЕ
 # =========================================================
 
 @dp.message(F.text == "📦 Новые заказы")
@@ -2533,18 +2790,13 @@ async def admin_new_orders(message: Message):
                 o.*,
                 s.store_name,
                 su.full_name AS created_by
-
             FROM orders o
-
             JOIN stores s
                 ON s.id = o.store_id
-
             LEFT JOIN store_users su
                 ON su.telegram_id =
                    o.created_by_telegram_id
-
             WHERE o.status = 'new'
-
             ORDER BY o.created_at ASC
             """
         )
@@ -2555,11 +2807,8 @@ async def admin_new_orders(message: Message):
                 id,
                 full_name,
                 vehicle
-
             FROM couriers
-
             WHERE status = 'approved'
-
             ORDER BY full_name
             """
         )
@@ -2619,7 +2868,7 @@ async def admin_new_orders(message: Message):
 
 
 # =========================================================
-# АДМИН — НАЗНАЧИТЬ КУРЬЕРА
+# АДМИН — НАЗНАЧЕНИЕ
 # =========================================================
 
 @dp.callback_query(F.data.startswith("assign:"))
@@ -2641,7 +2890,6 @@ async def assign_order(callback: CallbackQuery):
             """
             SELECT *
             FROM couriers
-
             WHERE id = $1
               AND status = 'approved'
             """,
@@ -2658,14 +2906,11 @@ async def assign_order(callback: CallbackQuery):
         order = await conn.fetchrow(
             """
             UPDATE orders
-
             SET
                 courier_id = $1,
                 status = 'assigned'
-
             WHERE id = $2
               AND status = 'new'
-
             RETURNING *
             """,
             courier_id,
@@ -2750,25 +2995,19 @@ async def admin_active_orders(message: Message):
                 c.full_name AS courier_name,
                 c.phone AS courier_phone,
                 su.full_name AS created_by
-
             FROM orders o
-
             JOIN stores s
                 ON s.id = o.store_id
-
             LEFT JOIN couriers c
                 ON c.id = o.courier_id
-
             LEFT JOIN store_users su
                 ON su.telegram_id =
                    o.created_by_telegram_id
-
             WHERE o.status NOT IN (
                 'new',
                 'delivered',
                 'cancelled'
             )
-
             ORDER BY o.id DESC
             """
         )
@@ -2825,6 +3064,8 @@ async def admin_active_orders(message: Message):
             f"📞 {order['client_phone']}\n"
             f"📍 {order['delivery_address']}\n"
             f"📦 {order['item']}\n"
+            f"🕐 {order['delivery_time']}\n"
+            f"📝 {order['comment']}\n\n"
             f"🚚 Курьер: "
             f"{order['courier_name'] or '-'}\n"
             f"📞 Курьер: "
@@ -2861,12 +3102,9 @@ async def cancel_order_admin(
                 o.store_id,
                 o.courier_id,
                 s.store_name
-
             FROM orders o
-
             JOIN stores s
                 ON s.id = o.store_id
-
             WHERE o.id = $1
             """,
             order_id,
@@ -2941,13 +3179,10 @@ async def confirm_cancel_order(
         order = await conn.fetchrow(
             """
             UPDATE orders
-
             SET status = 'cancelled'
-
             WHERE id = $1
               AND status != 'delivered'
               AND status != 'cancelled'
-
             RETURNING
                 id,
                 store_id,
@@ -2975,7 +3210,6 @@ async def confirm_cancel_order(
         courier_telegram_id = None
 
         if order["courier_id"]:
-
             courier_telegram_id = await conn.fetchval(
                 """
                 SELECT telegram_id
@@ -3044,9 +3278,7 @@ async def reassign_order(
                 id,
                 status,
                 courier_id
-
             FROM orders
-
             WHERE id = $1
             """,
             order_id,
@@ -3058,11 +3290,8 @@ async def reassign_order(
                 id,
                 full_name,
                 vehicle
-
             FROM couriers
-
             WHERE status = 'approved'
-
             ORDER BY full_name
             """
         )
@@ -3150,22 +3379,8 @@ async def confirm_reassign(
 
         order = await conn.fetchrow(
             """
-            SELECT
-                id,
-                status,
-                courier_id,
-                store_id,
-                client_name,
-                client_phone,
-                pickup_address,
-                delivery_address,
-                item,
-                delivery_time,
-                comment,
-                created_by_telegram_id
-
+            SELECT *
             FROM orders
-
             WHERE id = $1
             """,
             order_id,
@@ -3194,9 +3409,7 @@ async def confirm_reassign(
                 id,
                 telegram_id,
                 full_name
-
             FROM couriers
-
             WHERE id = $1
               AND status = 'approved'
             """,
@@ -3245,11 +3458,9 @@ async def confirm_reassign(
         await conn.execute(
             """
             UPDATE orders
-
             SET
                 courier_id = $1,
                 status = 'assigned'
-
             WHERE id = $2
             """,
             new_courier_id,
@@ -3338,23 +3549,16 @@ async def admin_delivered_orders(message: Message):
                 s.store_name,
                 c.full_name AS courier_name,
                 su.full_name AS created_by
-
             FROM orders o
-
             JOIN stores s
                 ON s.id = o.store_id
-
             LEFT JOIN couriers c
                 ON c.id = o.courier_id
-
             LEFT JOIN store_users su
                 ON su.telegram_id =
                    o.created_by_telegram_id
-
             WHERE o.status = 'delivered'
-
             ORDER BY o.id DESC
-
             LIMIT 20
             """
         )
@@ -3412,11 +3616,8 @@ async def admin_photos(callback: CallbackQuery):
             SELECT
                 photo_type,
                 file_id
-
             FROM order_photos
-
             WHERE order_id = $1
-
             ORDER BY created_at ASC
             """,
             order_id,
@@ -3469,17 +3670,19 @@ async def admin_stores(message: Message):
             SELECT
                 s.*,
                 COUNT(su.id) AS members_count
-
             FROM stores s
-
             LEFT JOIN store_users su
                 ON su.store_id = s.id
-
             GROUP BY s.id
-
             ORDER BY s.id DESC
             """
         )
+
+    if not stores:
+        await message.answer(
+            "🏪 Магазинов пока нет."
+        )
+        return
 
     for store in stores:
 
@@ -3535,6 +3738,12 @@ async def admin_couriers(message: Message):
             """
         )
 
+    if not couriers:
+        await message.answer(
+            "🚚 Курьеров пока нет."
+        )
+        return
+
     for courier in couriers:
 
         keyboard = None
@@ -3568,7 +3777,7 @@ async def admin_couriers(message: Message):
 
 
 # =========================================================
-# АДМИН — ОДОБРЕНИЕ МАГАЗИНА
+# АДМИН — МАГАЗИН ОДОБРИТЬ / ОТКЛОНИТЬ
 # =========================================================
 
 @dp.callback_query(
@@ -3589,9 +3798,7 @@ async def approve_store(callback: CallbackQuery):
             """
             UPDATE stores
             SET status = 'approved'
-
             WHERE id = $1
-
             RETURNING store_name
             """,
             store_id,
@@ -3607,6 +3814,10 @@ async def approve_store(callback: CallbackQuery):
         )
 
     if not store:
+        await callback.answer(
+            "Магазин не найден.",
+            show_alert=True,
+        )
         return
 
     await callback.message.edit_reply_markup(
@@ -3661,7 +3872,7 @@ async def reject_store(callback: CallbackQuery):
 
 
 # =========================================================
-# АДМИН — ОДОБРЕНИЕ КУРЬЕРА
+# АДМИН — КУРЬЕР ОДОБРИТЬ / ОТКЛОНИТЬ
 # =========================================================
 
 @dp.callback_query(
@@ -3684,9 +3895,7 @@ async def approve_courier(
             """
             UPDATE couriers
             SET status = 'approved'
-
             WHERE id = $1
-
             RETURNING
                 telegram_id,
                 full_name
@@ -3695,6 +3904,10 @@ async def approve_courier(
         )
 
     if not courier:
+        await callback.answer(
+            "Курьер не найден.",
+            show_alert=True,
+        )
         return
 
     await callback.message.edit_reply_markup(
@@ -3734,9 +3947,7 @@ async def reject_courier(
             """
             UPDATE couriers
             SET status = 'rejected'
-
             WHERE id = $1
-
             RETURNING telegram_id
             """,
             courier_id,
@@ -3761,7 +3972,7 @@ async def reject_courier(
 
 
 # =========================================================
-# ОТМЕНА ОБЫЧНОГО ДЕЙСТВИЯ
+# ОТМЕНА
 # =========================================================
 
 @dp.message(F.text == "❌ Отмена")
@@ -3769,7 +3980,6 @@ async def cancel_handler(
     message: Message,
     state: FSMContext,
 ):
-
     await state.clear()
     await send_main_menu(message)
 
