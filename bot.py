@@ -1432,6 +1432,144 @@ async def build_status_report(
         f"{courier}"
     )
 
+async def send_courier_order_card(
+    telegram_id: int,
+    order_id: int,
+):
+
+    async with db_pool.acquire() as conn:
+
+        order = await conn.fetchrow(
+            """
+            SELECT
+                o.*,
+                s.store_name
+
+            FROM orders o
+
+            JOIN stores s
+                ON s.id = o.store_id
+
+            WHERE o.id = $1
+            """,
+            order_id,
+        )
+
+    if not order:
+        return
+
+    buttons = []
+
+    if order["status"] == "assigned":
+
+        buttons = [[
+            InlineKeyboardButton(
+                text="✅ Принять заказ",
+                callback_data=f"accept_order:{order_id}",
+            )
+        ]]
+
+    elif order["status"] == "accepted":
+
+        buttons = [[
+            InlineKeyboardButton(
+                text="📸 Фото товара при получении",
+                callback_data=f"pickup_photo:{order_id}",
+            )
+        ]]
+
+    elif order["status"] == "pickup_photo":
+
+        buttons = [[
+            InlineKeyboardButton(
+                text="📦 Товар забран",
+                callback_data=f"picked_up:{order_id}",
+            )
+        ]]
+
+    elif order["status"] == "picked_up":
+
+        buttons = [[
+            InlineKeyboardButton(
+                text="🚗 Выехал к клиенту",
+                callback_data=f"on_way:{order_id}",
+            )
+        ]]
+
+    elif order["status"] == "on_the_way":
+
+        buttons = [[
+            InlineKeyboardButton(
+                text="📍 Я приехал",
+                callback_data=f"arrived:{order_id}",
+            )
+        ]]
+
+    elif order["status"] == "arrived":
+
+        buttons = [[
+            InlineKeyboardButton(
+                text="📸 Фото доставки",
+                callback_data=f"delivery_photo:{order_id}",
+            )
+        ]]
+
+    elif order["status"] == "delivery_photo":
+
+        buttons = [[
+            InlineKeyboardButton(
+                text="✅ Завершить доставку",
+                callback_data=f"delivered:{order_id}",
+            )
+        ]]
+
+    keyboard = None
+
+    if buttons:
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
+
+    await bot.send_message(
+        telegram_id,
+
+        f"🚚 ЗАКАЗ №{order['id']}\n\n"
+
+        f"🔢 Kittek №: "
+        f"{optional_number(order['kittek_order_number'])}\n"
+
+        f"🛒 Kaspi №: "
+        f"{optional_number(order['kaspi_order_number'])}\n\n"
+
+        f"🏪 Магазин: "
+        f"{order['store_name']}\n"
+
+        f"📍 Забрать: "
+        f"{order['pickup_address']}\n\n"
+
+        f"👤 Клиент: "
+        f"{order['client_name']}\n"
+
+        f"📞 {order['client_phone']}\n"
+
+        f"📍 Доставить: "
+        f"{order['delivery_address']}\n\n"
+
+        f"📦 {order['item']}\n"
+
+        f"🕐 {order['delivery_time']}\n"
+
+        f"📝 {order['comment']}\n\n"
+
+        f"💰 Стоимость: "
+        f"{price_text(order['delivery_price'])}\n"
+
+        f"Статус: "
+        f"{STATUS_NAMES.get(order['status'], order['status'])}",
+
+        reply_markup=keyboard,
+    )
 
 # =========================================================
 # START
