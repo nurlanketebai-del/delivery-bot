@@ -3786,6 +3786,240 @@ async def cancel_handler(
     await state.clear()
     await send_main_menu(message)
 
+# =========================================================
+# ПРИВЯЗКА TELEGRAM-ГРУППЫ К МАГАЗИНУ
+# =========================================================
+
+@dp.message(Command("bindorders"))
+async def bind_orders_topic(message: Message):
+
+    if message.chat.type not in {
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    }:
+        await message.answer(
+            "❌ Команду /bindorders нужно отправить "
+            "в Telegram-группе магазина."
+        )
+        return
+
+    if not message.message_thread_id:
+        await message.answer(
+            "❌ Команду нужно отправить именно "
+            "внутри нужной темы."
+        )
+        return
+
+    membership = await get_store_membership(
+        message.from_user.id
+    )
+
+    if not membership:
+        await message.answer(
+            "❌ Ваш Telegram-аккаунт "
+            "не привязан к магазину."
+        )
+        return
+
+    if membership["status"] != "approved":
+        await message.answer(
+            "❌ Магазин ещё не одобрен администратором."
+        )
+        return
+
+    if membership["member_role"] != "owner":
+        await message.answer(
+            "❌ Привязать группу может "
+            "только владелец магазина."
+        )
+        return
+
+    async with db_pool.acquire() as conn:
+
+        await conn.execute(
+            """
+            INSERT INTO store_report_settings (
+                store_id,
+                group_chat_id,
+                new_orders_topic_id,
+                updated_at
+            )
+
+            VALUES ($1,$2,$3,NOW())
+
+            ON CONFLICT (store_id)
+
+            DO UPDATE SET
+                group_chat_id = EXCLUDED.group_chat_id,
+                new_orders_topic_id =
+                    EXCLUDED.new_orders_topic_id,
+                updated_at = NOW()
+            """,
+            membership["store_id"],
+            message.chat.id,
+            message.message_thread_id,
+        )
+
+    await message.answer(
+        "✅ ТЕМА НОВЫХ ЗАКАЗОВ ПРИВЯЗАНА!\n\n"
+        f"🏪 Магазин: {membership['store_name']}\n"
+        "📦 Сюда будут поступать новые заказы."
+    )
+
+
+@dp.message(Command("bindstatus"))
+async def bind_status_topic(message: Message):
+
+    if message.chat.type not in {
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    }:
+        await message.answer(
+            "❌ Команду /bindstatus нужно отправить "
+            "в Telegram-группе магазина."
+        )
+        return
+
+    if not message.message_thread_id:
+        await message.answer(
+            "❌ Команду нужно отправить именно "
+            "внутри нужной темы."
+        )
+        return
+
+    membership = await get_store_membership(
+        message.from_user.id
+    )
+
+    if not membership:
+        await message.answer(
+            "❌ Ваш Telegram-аккаунт "
+            "не привязан к магазину."
+        )
+        return
+
+    if membership["status"] != "approved":
+        await message.answer(
+            "❌ Магазин ещё не одобрен администратором."
+        )
+        return
+
+    if membership["member_role"] != "owner":
+        await message.answer(
+            "❌ Привязать группу может "
+            "только владелец магазина."
+        )
+        return
+
+    async with db_pool.acquire() as conn:
+
+        current = await conn.fetchrow(
+            """
+            SELECT group_chat_id
+            FROM store_report_settings
+            WHERE store_id = $1
+            """,
+            membership["store_id"],
+        )
+
+        if (
+            current
+            and current["group_chat_id"]
+            and current["group_chat_id"] != message.chat.id
+        ):
+            await message.answer(
+                "❌ Новые заказы уже привязаны "
+                "к другой группе.\n\n"
+                "Сначала выполните /bindorders "
+                "в этой группе."
+            )
+            return
+
+        await conn.execute(
+            """
+            INSERT INTO store_report_settings (
+                store_id,
+                group_chat_id,
+                status_topic_id,
+                updated_at
+            )
+
+            VALUES ($1,$2,$3,NOW())
+
+            ON CONFLICT (store_id)
+
+            DO UPDATE SET
+                group_chat_id = EXCLUDED.group_chat_id,
+                status_topic_id =
+                    EXCLUDED.status_topic_id,
+                updated_at = NOW()
+            """,
+            membership["store_id"],
+            message.chat.id,
+            message.message_thread_id,
+        )
+
+    await message.answer(
+        "✅ ТЕМА СТАТУСОВ ПРИВЯЗАНА!\n\n"
+        f"🏪 Магазин: {membership['store_name']}\n"
+        "🚚 Сюда будут поступать статусы "
+        "и фотоотчёты."
+    )
+
+
+@dp.message(Command("reportsettings"))
+async def report_settings(message: Message):
+
+    membership = await get_store_membership(
+        message.from_user.id
+    )
+
+    if not membership:
+        await message.answer(
+            "❌ Вы не привязаны к магазину."
+        )
+        return
+
+    async with db_pool.acquire() as conn:
+
+        settings = await conn.fetchrow(
+            """
+            SELECT
+                group_chat_id,
+                new_orders_topic_id,
+                status_topic_id
+
+            FROM store_report_settings
+
+            WHERE store_id = $1
+            """,
+            membership["store_id"],
+        )
+
+    if not settings:
+        await message.answer(
+            "⚙️ Группа магазина ещё не настроена."
+        )
+        return
+
+    orders_text = (
+        "✅ Привязана"
+        if settings["new_orders_topic_id"]
+        else "❌ Не привязана"
+    )
+
+    statuses_text = (
+        "✅ Привязана"
+        if settings["status_topic_id"]
+        else "❌ Не привязана"
+    )
+
+    await message.answer(
+        "⚙️ НАСТРОЙКИ ГРУППЫ\n\n"
+        f"🏪 {membership['store_name']}\n\n"
+        f"📦 Новые заказы: {orders_text}\n"
+        f"🚚 Статусы/фото: {statuses_text}"
+    )
 
 # =========================================================
 # FALLBACK
