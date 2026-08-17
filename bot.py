@@ -5113,18 +5113,11 @@ async def accept_order(
 
         return
 
-    await callback.message.edit_reply_markup(
-        reply_markup=None
+    await update_courier_order_card(
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        order_id=order_id,
     )
-
-    await callback.message.answer(
-        f"✅ Заказ №{order_id} принят."
-    )
-
-    await send_courier_order_card(
-    callback.from_user.id,
-    order_id,
-)
 
     await notify_store_users(
         order["store_id"],
@@ -5206,7 +5199,9 @@ async def pickup_photo_request(
         return
 
     await state.update_data(
-        order_id=order_id
+        order_id=order_id,
+        courier_card_chat_id=callback.message.chat.id,
+        courier_card_message_id=callback.message.message_id,
     )
 
     await state.set_state(
@@ -5326,7 +5321,10 @@ async def pickup_photo_received(
         f"✅ Фото заказа №"
         f"{order_id} сохранено."
     )
-
+    await send_courier_order_card(
+        message.from_user.id,
+        order_id,
+)
     await send_courier_order_card(
         message.from_user.id,
         order_id,
@@ -5431,18 +5429,14 @@ async def picked_up(
 
         return
 
-    await callback.message.edit_reply_markup(
-        reply_markup=None
+    await update_courier_order_card(
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        order_id=order_id,
     )
 
-    await callback.message.answer(
-        f"📦 Заказ №{order_id}: "
-        "товар забран."
-    )
-
-    await send_courier_order_card(
-        callback.from_user.id,
-        order_id,
+    await callback.answer(
+        "📦 Товар забран."
     )
 
     await notify_store_users(
@@ -5533,19 +5527,14 @@ async def on_way(
         )
 
         return
-
-    await callback.message.edit_reply_markup(
-        reply_markup=None
+    await update_courier_order_card(
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        order_id=order_id,
     )
 
-    await callback.message.answer(
-        f"🚗 Заказ №{order_id}: "
-        "вы выехали."
-    )
-
-    await send_courier_order_card(
-        callback.from_user.id,
-        order_id,
+    await callback.answer(
+        "🚗 Вы выехали к клиенту."
     )
 
     await notify_store_users(
@@ -5637,18 +5626,14 @@ async def arrived(
 
         return
 
-    await callback.message.edit_reply_markup(
-        reply_markup=None
+    await update_courier_order_card(
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        order_id=order_id,
     )
 
-    await callback.message.answer(
-        f"📍 Заказ №{order_id}: "
-        "вы прибыли к клиенту."
-    )
-
-    await send_courier_order_card(
-        callback.from_user.id,
-        order_id,
+    await callback.answer(
+        "📍 Вы прибыли к клиенту."
     )
 
     await notify_store_users(
@@ -5731,7 +5716,9 @@ async def delivery_photo_request(
         return
 
     await state.update_data(
-        order_id=order_id
+        order_id=order_id,
+        courier_card_chat_id=callback.message.chat.id,
+        courier_card_message_id=callback.message.message_id,
     )
 
     await state.set_state(
@@ -5761,6 +5748,16 @@ async def delivery_photo_received(
         "order_id"
     ]
 
+  
+
+    courier_card_chat_id = data.get(
+        "courier_card_chat_id"
+    )
+
+    courier_card_message_id = data.get(
+        "courier_card_message_id"
+    )
+    
     courier_id = await get_approved_courier_id(
         message.from_user.id
     )
@@ -5844,7 +5841,15 @@ async def delivery_photo_received(
                 message.from_user.id,
                 "Фото подтверждения доставки",
             )
-
+    if (
+        courier_card_chat_id
+        and courier_card_message_id
+    ):
+        await update_courier_order_card(
+            chat_id=courier_card_chat_id,
+            message_id=courier_card_message_id,
+            order_id=order_id,
+        )
     await state.clear()
 
     await message.answer(
@@ -5852,11 +5857,7 @@ async def delivery_photo_received(
         f"№{order_id} сохранено."
     )
 
-    await send_courier_order_card(
-        message.from_user.id,
-        order_id,
-    )
-
+  
     await notify_store_users(
         order["store_id"],
 
@@ -5957,12 +5958,14 @@ async def delivered(
 
         return
 
-    await callback.message.edit_reply_markup(
-        reply_markup=None
+    await update_courier_order_card(
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        order_id=order_id,
     )
 
-    await callback.message.answer(
-        f"✅ Заказ №{order_id} доставлен!"
+    await callback.answer(
+        "✅ Доставка завершена."
     )
 
     await callback.message.answer(
