@@ -5083,6 +5083,11 @@ async def accept_order(
         f"✅ Заказ №{order_id} принят."
     )
 
+    await send_courier_order_card(
+    callback.from_user.id,
+    order_id,
+)
+
     await notify_store_users(
         order["store_id"],
 
