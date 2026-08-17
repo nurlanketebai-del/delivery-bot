@@ -5289,6 +5289,11 @@ async def pickup_photo_received(
         f"{order_id} сохранено."
     )
 
+    await send_courier_order_card(
+        message.from_user.id,
+        order_id,
+    )
+
     await notify_store_users(
         order["store_id"],
 
