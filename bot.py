@@ -406,6 +406,17 @@ async def init_db():
             )
             """
         )
+        await conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS store_report_settings (
+        store_id INTEGER PRIMARY KEY REFERENCES stores(id) ON DELETE CASCADE,
+        group_chat_id BIGINT,
+        new_orders_topic_id BIGINT,
+        status_topic_id BIGINT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """
+)
 
         # Миграции старой базы
 
