@@ -5402,6 +5402,11 @@ async def picked_up(
         "товар забран."
     )
 
+    await send_courier_order_card(
+        callback.from_user.id,
+        order_id,
+    )
+
     await notify_store_users(
         order["store_id"],
 
@@ -5500,6 +5505,11 @@ async def on_way(
         "вы выехали."
     )
 
+    await send_courier_order_card(
+        callback.from_user.id,
+        order_id,
+    )
+
     await notify_store_users(
         order["store_id"],
 
@@ -5596,6 +5606,11 @@ async def arrived(
     await callback.message.answer(
         f"📍 Заказ №{order_id}: "
         "вы прибыли к клиенту."
+    )
+
+    await send_courier_order_card(
+        callback.from_user.id,
+        order_id,
     )
 
     await notify_store_users(
@@ -5799,6 +5814,11 @@ async def delivery_photo_received(
         f"№{order_id} сохранено."
     )
 
+    await send_courier_order_card(
+        message.from_user.id,
+        order_id,
+    )
+
     await notify_store_users(
         order["store_id"],
 
@@ -5905,6 +5925,13 @@ async def delivered(
 
     await callback.message.answer(
         f"✅ Заказ №{order_id} доставлен!"
+    )
+
+    await callback.message.answer(
+        "🎉 Доставка завершена.\n\n"
+        "Чтобы продолжить работу, откройте "
+        "«📦 Мои доставки».",
+        reply_markup=courier_keyboard,
     )
 
     await notify_store_users(
