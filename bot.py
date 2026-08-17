@@ -3773,51 +3773,6 @@ async def cancel_handler(
     await state.clear()
     await send_main_menu(message)
 
-# =========================================================
-# ВРЕМЕННАЯ ОЧИСТКА ТЕСТОВЫХ ДАННЫХ
-# =========================================================
-
-@dp.message(Command("resettestdata"))
-async def reset_test_data(message: Message):
-
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Доступ запрещён.")
-        return
-
-    async with db_pool.acquire() as conn:
-
-        await conn.execute(
-            """
-            TRUNCATE TABLE
-                order_photos,
-                order_status_history,
-                orders,
-                store_invites,
-                store_report_settings,
-                store_users,
-                couriers,
-                stores
-            RESTART IDENTITY CASCADE
-            """
-        )
-
-        await conn.execute(
-            """
-            DROP TABLE IF EXISTS telegram_report_topics
-            """
-        )
-
-    await message.answer(
-        "✅ ВСЕ ТЕСТОВЫЕ ДАННЫЕ УДАЛЕНЫ.\n\n"
-        "📦 Заказы: 0\n"
-        "🏪 Магазины: 0\n"
-        "👥 Менеджеры: 0\n"
-        "🚚 Курьеры: 0\n"
-        "📸 Фото: 0\n"
-        "🕐 История: 0\n"
-        "💬 Привязки групп: 0\n\n"
-        "ID также сброшены."
-    )
 
 # =========================================================
 # FALLBACK
