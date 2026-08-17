@@ -108,6 +108,11 @@ class OrderCreation(StatesGroup):
     kaspi_order_number = State()
     delivery_time = State()
     comment = State()
+
+    # НОВОЕ:
+    # Этап загрузки документов
+    documents = State()
+
     confirm = State()
 
 
@@ -310,6 +315,22 @@ skip_keyboard = ReplyKeyboardMarkup(
 )
 
 
+# =========================================================
+# НОВОЕ — КНОПКА ДЛЯ ДОКУМЕНТОВ
+# =========================================================
+
+documents_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(
+                text="✅ Готово"
+            )
+        ],
+    ],
+    resize_keyboard=True,
+)
+
+
 admin_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [
@@ -453,6 +474,33 @@ async def init_db():
                 photo_type TEXT NOT NULL,
 
                 file_id TEXT NOT NULL,
+
+                created_at TIMESTAMPTZ
+                    NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+
+        # =================================================
+        # НОВОЕ — ДОКУМЕНТЫ ЗАКАЗА
+        # =================================================
+
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS order_documents (
+                id SERIAL PRIMARY KEY,
+
+                order_id INTEGER NOT NULL
+                    REFERENCES orders(id)
+                    ON DELETE CASCADE,
+
+                file_id TEXT NOT NULL,
+
+                file_name TEXT,
+
+                mime_type TEXT,
+
+                file_size BIGINT,
 
                 created_at TIMESTAMPTZ
                     NOT NULL DEFAULT NOW()
@@ -1216,6 +1264,126 @@ async def send_store_topic_photo(
             "STORE GROUP PHOTO ERROR:",
             store_id,
             error,
+        )
+
+
+# =========================================================
+# НОВОЕ — ОТПРАВКА ДОКУМЕНТА В ТЕМУ НОВЫХ ЗАКАЗОВ
+# =========================================================
+
+async def send_store_topic_document(
+    store_id: int,
+    file_id: str,
+    caption: str,
+):
+
+    settings = await get_store_report_settings(
+        store_id
+    )
+
+    if not settings:
+        return
+
+    chat_id = settings[
+        "group_chat_id"
+    ]
+
+    topic_id = settings[
+        "new_orders_topic_id"
+    ]
+
+    if (
+        not chat_id
+        or not topic_id
+    ):
+        return
+
+    try:
+
+        await bot.send_document(
+            chat_id=chat_id,
+            message_thread_id=topic_id,
+            document=file_id,
+            caption=caption,
+        )
+
+    except Exception as error:
+
+        print(
+            "STORE GROUP DOCUMENT ERROR:",
+            store_id,
+            error,
+        )
+
+
+# =========================================================
+# НОВОЕ — ПОЛУЧЕНИЕ ДОКУМЕНТОВ ЗАКАЗА ИЗ БАЗЫ
+# =========================================================
+
+async def get_order_documents(
+    order_id: int
+):
+
+    async with db_pool.acquire() as conn:
+
+        return await conn.fetch(
+            """
+            SELECT
+                id,
+                file_id,
+                file_name,
+                mime_type,
+                file_size,
+                created_at
+
+            FROM order_documents
+
+            WHERE order_id = $1
+
+            ORDER BY id ASC
+            """,
+            order_id,
+        )
+
+
+# =========================================================
+# НОВОЕ — ОТПРАВКА ВСЕХ ДОКУМЕНТОВ ПОСЛЕ КАРТОЧКИ
+# =========================================================
+
+async def send_order_documents_to_group(
+    order_id: int,
+    store_id: int,
+):
+
+    documents = await get_order_documents(
+        order_id
+    )
+
+    if not documents:
+        return
+
+    total = len(documents)
+
+    for index, document in enumerate(
+        documents,
+        start=1,
+    ):
+
+        file_name = (
+            document["file_name"]
+            or "Документ"
+        )
+
+        caption = (
+            f"📎 Заказ №{order_id}\n"
+            f"Документ {index}/{total}\n"
+            f"📄 {file_name}"
+        )
+
+        await send_store_topic_document(
+            store_id=store_id,
+            file_id=document["file_id"],
+            caption=caption,
         )
 
 
@@ -2898,6 +3066,11 @@ async def order_start(
 
     await state.clear()
 
+    # Сразу создаём пустой список документов
+    await state.update_data(
+        documents=[]
+    )
+
     await state.set_state(
         OrderCreation.client_name
     )
@@ -3086,6 +3259,10 @@ async def order_delivery_time(
     )
 
 
+# =========================================================
+# ИЗМЕНЕНО — ПОСЛЕ КОММЕНТАРИЯ ИДУТ ДОКУМЕНТЫ
+# =========================================================
+
 @dp.message(
     OrderCreation.comment
 )
@@ -3097,6 +3274,86 @@ async def order_comment(
     await state.update_data(
         comment=message.text
     )
+
+    await state.set_state(
+        OrderCreation.documents
+    )
+
+    await message.answer(
+        "📎 ДОКУМЕНТЫ К ЗАКАЗУ\n\n"
+
+        "Отправьте нужные документы.\n"
+        "Можно отправить несколько файлов — "
+        "по одному или сразу несколько.\n\n"
+
+        "Когда все документы будут добавлены, "
+        "нажмите «✅ Готово».\n\n"
+
+        "Если документов нет — "
+        "просто нажмите «✅ Готово».",
+
+        reply_markup=documents_keyboard,
+    )
+
+
+# =========================================================
+# НОВОЕ — ПРИНИМАЕМ ДОКУМЕНТЫ
+# =========================================================
+
+@dp.message(
+    OrderCreation.documents,
+    F.document,
+)
+async def order_document_received(
+    message: Message,
+    state: FSMContext,
+):
+
+    data = await state.get_data()
+
+    documents = data.get(
+        "documents",
+        [],
+    )
+
+    document = message.document
+
+    documents.append({
+        "file_id": document.file_id,
+        "file_name": (
+            document.file_name
+            or "document"
+        ),
+        "mime_type": document.mime_type,
+        "file_size": document.file_size,
+    })
+
+    await state.update_data(
+        documents=documents
+    )
+
+    await message.answer(
+        f"✅ Файл добавлен.\n\n"
+        f"📎 Документов: {len(documents)}\n\n"
+        "Отправьте следующий файл "
+        "или нажмите «✅ Готово».",
+
+        reply_markup=documents_keyboard,
+    )
+
+
+# =========================================================
+# НОВОЕ — НАЖАЛИ "ГОТОВО"
+# =========================================================
+
+@dp.message(
+    OrderCreation.documents,
+    F.text == "✅ Готово",
+)
+async def order_documents_done(
+    message: Message,
+    state: FSMContext,
+):
 
     data = await state.get_data()
 
@@ -3114,8 +3371,19 @@ async def order_comment(
 
         return
 
+    documents = data.get(
+        "documents",
+        [],
+    )
+
     await state.set_state(
         OrderCreation.confirm
+    )
+
+    documents_text = (
+        f"📎 Документов: {len(documents)}"
+        if documents
+        else "📎 Документы: нет"
     )
 
     await message.answer(
@@ -3154,11 +3422,38 @@ async def order_comment(
         f"📝 Комментарий: "
         f"{data['comment']}\n\n"
 
+        f"{documents_text}\n\n"
+
         "Создать заказ?",
 
         reply_markup=order_confirm_keyboard,
     )
 
+
+# =========================================================
+# НОВОЕ — ЕСЛИ НА ЭТАПЕ ДОКУМЕНТОВ ПРИШЛО НЕ ТО
+# =========================================================
+
+@dp.message(
+    OrderCreation.documents
+)
+async def order_document_wrong(
+    message: Message
+):
+
+    await message.answer(
+        "📎 На этом этапе отправьте файл "
+        "как документ.\n\n"
+        "Когда закончите — "
+        "нажмите «✅ Готово».",
+
+        reply_markup=documents_keyboard,
+    )
+
+
+# =========================================================
+# ИЗМЕНЕНО — СОЗДАНИЕ ЗАКАЗА + СОХРАНЕНИЕ ДОКУМЕНТОВ
+# =========================================================
 
 @dp.message(
     OrderCreation.confirm,
@@ -3187,6 +3482,11 @@ async def order_confirm(
         )
 
         return
+
+    documents = data.get(
+        "documents",
+        [],
+    )
 
     async with db_pool.acquire() as conn:
 
@@ -3232,26 +3532,68 @@ async def order_confirm(
                 message.from_user.id,
             )
 
+            # =============================================
+            # СОХРАНЯЕМ ВСЕ ДОКУМЕНТЫ В БАЗУ
+            # =============================================
+
+            for document in documents:
+
+                await conn.execute(
+                    """
+                    INSERT INTO order_documents (
+                        order_id,
+                        file_id,
+                        file_name,
+                        mime_type,
+                        file_size
+                    )
+
+                    VALUES (
+                        $1,$2,$3,$4,$5
+                    )
+                    """,
+                    order_id,
+                    document["file_id"],
+                    document.get(
+                        "file_name"
+                    ),
+                    document.get(
+                        "mime_type"
+                    ),
+                    document.get(
+                        "file_size"
+                    ),
+                )
+
             await add_history(
                 conn,
                 order_id,
                 "new",
                 "store",
                 message.from_user.id,
-                "Заказ создан",
+                (
+                    "Заказ создан"
+                    if not documents
+                    else (
+                        f"Заказ создан. "
+                        f"Документов: "
+                        f"{len(documents)}"
+                    )
+                ),
             )
 
     await state.clear()
 
     await message.answer(
         f"✅ Заказ №{order_id} создан!\n\n"
+        f"📎 Документов: {len(documents)}\n"
         "Статус: 🆕 Новый",
 
         reply_markup=store_keyboard,
     )
 
     # =====================================================
-    # АВТООТПРАВКА В ТЕМУ НОВЫХ ЗАКАЗОВ
+    # 1. СНАЧАЛА КАРТОЧКА ЗАКАЗА В ТЕМУ
     # =====================================================
 
     order = await get_order_full(
@@ -3272,6 +3614,15 @@ async def order_confirm(
                     f"{order_id}"
                 ),
             ),
+        )
+
+        # =================================================
+        # 2. СРАЗУ ПОСЛЕ КАРТОЧКИ — ВСЕ ДОКУМЕНТЫ
+        # =================================================
+
+        await send_order_documents_to_group(
+            order_id=order_id,
+            store_id=order["store_id"],
         )
 
 
@@ -3324,7 +3675,13 @@ async def store_orders(
                 o.*,
 
                 su.full_name
-                    AS created_by
+                    AS created_by,
+
+                (
+                    SELECT COUNT(*)
+                    FROM order_documents od
+                    WHERE od.order_id = o.id
+                ) AS documents_count
 
             FROM orders o
 
@@ -3395,6 +3752,9 @@ async def store_orders(
 
             f"🛒 Kaspi №: "
             f"{optional_number(order['kaspi_order_number'])}\n\n"
+
+            f"📎 Документов: "
+            f"{order['documents_count']}\n\n"
 
             f"👤 Создал: "
             f"{author}\n"
