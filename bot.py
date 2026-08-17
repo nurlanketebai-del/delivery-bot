@@ -1432,8 +1432,85 @@ async def build_status_report(
         f"{courier}"
     )
 
-async def send_courier_order_card(
-    telegram_id: int,
+def courier_order_keyboard(
+    order_id: int,
+    status: str,
+):
+
+    buttons = []
+
+    if status == "assigned":
+
+        buttons = [[
+            InlineKeyboardButton(
+                text="✅ Принять заказ",
+                callback_data=f"accept_order:{order_id}",
+            )
+        ]]
+
+    elif status == "accepted":
+
+        buttons = [[
+            InlineKeyboardButton(
+                text="📸 Фото товара при получении",
+                callback_data=f"pickup_photo:{order_id}",
+            )
+        ]]
+
+    elif status == "pickup_photo":
+
+        buttons = [[
+            InlineKeyboardButton(
+                text="📦 Товар забран",
+                callback_data=f"picked_up:{order_id}",
+            )
+        ]]
+
+    elif status == "picked_up":
+
+        buttons = [[
+            InlineKeyboardButton(
+                text="🚗 Выехал к клиенту",
+                callback_data=f"on_way:{order_id}",
+            )
+        ]]
+
+    elif status == "on_the_way":
+
+        buttons = [[
+            InlineKeyboardButton(
+                text="📍 Я приехал",
+                callback_data=f"arrived:{order_id}",
+            )
+        ]]
+
+    elif status == "arrived":
+
+        buttons = [[
+            InlineKeyboardButton(
+                text="📸 Фото доставки",
+                callback_data=f"delivery_photo:{order_id}",
+            )
+        ]]
+
+    elif status == "delivery_photo":
+
+        buttons = [[
+            InlineKeyboardButton(
+                text="✅ Завершить доставку",
+                callback_data=f"delivered:{order_id}",
+            )
+        ]]
+
+    if not buttons:
+        return None
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=buttons
+    )
+
+
+async def get_courier_order_card(
     order_id: int,
 ):
 
@@ -1456,84 +1533,9 @@ async def send_courier_order_card(
         )
 
     if not order:
-        return
+        return None, None
 
-    buttons = []
-
-    if order["status"] == "assigned":
-
-        buttons = [[
-            InlineKeyboardButton(
-                text="✅ Принять заказ",
-                callback_data=f"accept_order:{order_id}",
-            )
-        ]]
-
-    elif order["status"] == "accepted":
-
-        buttons = [[
-            InlineKeyboardButton(
-                text="📸 Фото товара при получении",
-                callback_data=f"pickup_photo:{order_id}",
-            )
-        ]]
-
-    elif order["status"] == "pickup_photo":
-
-        buttons = [[
-            InlineKeyboardButton(
-                text="📦 Товар забран",
-                callback_data=f"picked_up:{order_id}",
-            )
-        ]]
-
-    elif order["status"] == "picked_up":
-
-        buttons = [[
-            InlineKeyboardButton(
-                text="🚗 Выехал к клиенту",
-                callback_data=f"on_way:{order_id}",
-            )
-        ]]
-
-    elif order["status"] == "on_the_way":
-
-        buttons = [[
-            InlineKeyboardButton(
-                text="📍 Я приехал",
-                callback_data=f"arrived:{order_id}",
-            )
-        ]]
-
-    elif order["status"] == "arrived":
-
-        buttons = [[
-            InlineKeyboardButton(
-                text="📸 Фото доставки",
-                callback_data=f"delivery_photo:{order_id}",
-            )
-        ]]
-
-    elif order["status"] == "delivery_photo":
-
-        buttons = [[
-            InlineKeyboardButton(
-                text="✅ Завершить доставку",
-                callback_data=f"delivered:{order_id}",
-            )
-        ]]
-
-    keyboard = None
-
-    if buttons:
-
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        )
-
-    await bot.send_message(
-        telegram_id,
-
+    text = (
         f"🚚 ЗАКАЗ №{order['id']}\n\n"
 
         f"🔢 Kittek №: "
@@ -1566,10 +1568,46 @@ async def send_courier_order_card(
         f"{price_text(order['delivery_price'])}\n"
 
         f"Статус: "
-        f"{STATUS_NAMES.get(order['status'], order['status'])}",
-
-        reply_markup=keyboard,
+        f"{STATUS_NAMES.get(order['status'], order['status'])}"
     )
+
+    keyboard = courier_order_keyboard(
+        order_id,
+        order["status"],
+    )
+
+    return text, keyboard
+
+
+async def update_courier_order_card(
+    chat_id: int,
+    message_id: int,
+    order_id: int,
+):
+
+    text, keyboard = await get_courier_order_card(
+        order_id
+    )
+
+    if not text:
+        return
+
+    try:
+
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=keyboard,
+        )
+
+    except Exception as error:
+
+        print(
+            "COURIER CARD UPDATE ERROR:",
+            order_id,
+            error,
+        )
 
 # =========================================================
 # START
