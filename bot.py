@@ -1121,19 +1121,35 @@ async def myid_handler(message: Message):
 
 
 # =========================================================
-# ПРИВЯЗКА ТЕМ ГРУППЫ
+# ПРИВЯЗКА ГРУППЫ И ТЕМ К МАГАЗИНУ
 # =========================================================
+
+async def get_store_report_settings(store_id: int):
+
+    async with db_pool.acquire() as conn:
+
+        return await conn.fetchrow(
+            """
+            SELECT
+                store_id,
+                group_chat_id,
+                new_orders_topic_id,
+                status_topic_id
+
+            FROM store_report_settings
+
+            WHERE store_id = $1
+            """,
+            store_id,
+        )
+
 
 @dp.message(Command("bindorders"))
 async def bind_orders_topic(
     message: Message
 ):
 
-    if not is_admin(
-        message.from_user.id
-    ):
-        return
-
+    # Команда должна быть в группе
     if message.chat.type not in {
         ChatType.GROUP,
         ChatType.SUPERGROUP,
@@ -1141,33 +1157,80 @@ async def bind_orders_topic(
 
         await message.answer(
             "❌ Эту команду нужно отправить "
-            "в Telegram-группе."
+            "в группе магазина."
         )
-
         return
 
-    topic_id = message.message_thread_id
-
-    if not topic_id:
+    # Команда должна быть именно внутри темы
+    if not message.message_thread_id:
 
         await message.answer(
-            "❌ Откройте нужную тему группы "
-            "и отправьте /bindorders именно внутри темы."
+            "❌ Откройте тему для новых заказов "
+            "и отправьте /bindorders внутри неё."
         )
-
         return
 
-    await save_report_topic(
-        "new_orders",
-        message.chat.id,
-        topic_id,
-        message.chat.title,
+    # Определяем магазин по Telegram ID владельца
+    membership = await get_store_membership(
+        message.from_user.id
     )
 
+    if not membership:
+
+        await message.answer(
+            "❌ Ваш Telegram-аккаунт "
+            "не привязан к магазину."
+        )
+        return
+
+    if membership["status"] != "approved":
+
+        await message.answer(
+            "❌ Сначала магазин должен быть "
+            "одобрен администратором."
+        )
+        return
+
+    # Для безопасности привязывать группу
+    # может только владелец магазина
+    if membership["member_role"] != "owner":
+
+        await message.answer(
+            "❌ Привязать группу может "
+            "только владелец магазина."
+        )
+        return
+
+    async with db_pool.acquire() as conn:
+
+        await conn.execute(
+            """
+            INSERT INTO store_report_settings (
+                store_id,
+                group_chat_id,
+                new_orders_topic_id,
+                updated_at
+            )
+
+            VALUES ($1,$2,$3,NOW())
+
+            ON CONFLICT (store_id)
+
+            DO UPDATE SET
+                group_chat_id = EXCLUDED.group_chat_id,
+                new_orders_topic_id =
+                    EXCLUDED.new_orders_topic_id,
+                updated_at = NOW()
+            """,
+            membership["store_id"],
+            message.chat.id,
+            message.message_thread_id,
+        )
+
     await message.answer(
-        "✅ ГОТОВО!\n\n"
-        "Эта тема теперь используется "
-        "для НОВЫХ ЗАКАЗОВ."
+        "✅ ТЕМА ПРИВЯЗАНА!\n\n"
+        f"🏪 Магазин: {membership['store_name']}\n"
+        "📦 Назначение: НОВЫЕ ЗАКАЗЫ"
     )
 
 
@@ -1176,11 +1239,6 @@ async def bind_status_topic(
     message: Message
 ):
 
-    if not is_admin(
-        message.from_user.id
-    ):
-        return
-
     if message.chat.type not in {
         ChatType.GROUP,
         ChatType.SUPERGROUP,
@@ -1188,33 +1246,104 @@ async def bind_status_topic(
 
         await message.answer(
             "❌ Эту команду нужно отправить "
-            "в Telegram-группе."
+            "в группе магазина."
         )
-
         return
 
-    topic_id = message.message_thread_id
-
-    if not topic_id:
+    if not message.message_thread_id:
 
         await message.answer(
-            "❌ Откройте нужную тему группы "
-            "и отправьте /bindstatus именно внутри темы."
+            "❌ Откройте тему для отчётов "
+            "и отправьте /bindstatus внутри неё."
         )
-
         return
 
-    await save_report_topic(
-        "statuses",
-        message.chat.id,
-        topic_id,
-        message.chat.title,
+    membership = await get_store_membership(
+        message.from_user.id
     )
 
+    if not membership:
+
+        await message.answer(
+            "❌ Ваш Telegram-аккаунт "
+            "не привязан к магазину."
+        )
+        return
+
+    if membership["status"] != "approved":
+
+        await message.answer(
+            "❌ Сначала магазин должен быть "
+            "одобрен администратором."
+        )
+        return
+
+    if membership["member_role"] != "owner":
+
+        await message.answer(
+            "❌ Привязать группу может "
+            "только владелец магазина."
+        )
+        return
+
+    async with db_pool.acquire() as conn:
+
+        settings = await conn.fetchrow(
+            """
+            SELECT group_chat_id
+
+            FROM store_report_settings
+
+            WHERE store_id = $1
+            """,
+            membership["store_id"],
+        )
+
+        # Если тема новых заказов уже была привязана,
+        # проверяем, что это та же группа
+        if (
+            settings
+            and settings["group_chat_id"]
+            and settings["group_chat_id"]
+                != message.chat.id
+        ):
+
+            await message.answer(
+                "❌ Тема новых заказов уже привязана "
+                "к другой группе.\n\n"
+                "Сначала выполните /bindorders "
+                "в этой группе."
+            )
+            return
+
+        await conn.execute(
+            """
+            INSERT INTO store_report_settings (
+                store_id,
+                group_chat_id,
+                status_topic_id,
+                updated_at
+            )
+
+            VALUES ($1,$2,$3,NOW())
+
+            ON CONFLICT (store_id)
+
+            DO UPDATE SET
+                group_chat_id = EXCLUDED.group_chat_id,
+                status_topic_id =
+                    EXCLUDED.status_topic_id,
+                updated_at = NOW()
+            """,
+            membership["store_id"],
+            message.chat.id,
+            message.message_thread_id,
+        )
+
     await message.answer(
-        "✅ ГОТОВО!\n\n"
-        "Эта тема теперь используется "
-        "для СТАТУСОВ И ФОТООТЧЁТОВ."
+        "✅ ТЕМА ПРИВЯЗАНА!\n\n"
+        f"🏪 Магазин: {membership['store_name']}\n"
+        "🚚 Назначение: СТАТУСЫ И ФОТООТЧЁТЫ"
     )
 
 
@@ -1223,65 +1352,47 @@ async def report_settings(
     message: Message
 ):
 
-    if not is_admin(
+    membership = await get_store_membership(
         message.from_user.id
-    ):
+    )
+
+    if not membership:
+
+        await message.answer(
+            "❌ Магазин не найден."
+        )
         return
 
-    orders_topic = await get_report_topic(
-        "new_orders"
+    settings = await get_store_report_settings(
+        membership["store_id"]
     )
 
-    status_topic = await get_report_topic(
-        "statuses"
+    if not settings:
+
+        await message.answer(
+            f"🏪 {membership['store_name']}\n\n"
+            "❌ Telegram-группа ещё не настроена."
+        )
+        return
+
+    orders_status = (
+        "✅ Привязана"
+        if settings["new_orders_topic_id"]
+        else "❌ Не привязана"
     )
 
-    text = "⚙️ НАСТРОЙКИ ГРУППЫ\n\n"
+    reports_status = (
+        "✅ Привязана"
+        if settings["status_topic_id"]
+        else "❌ Не привязана"
+    )
 
-    if orders_topic:
-
-        text += (
-            "🆕 Новые заказы: ✅\n"
-            f"Group ID: "
-            f"{orders_topic['chat_id']}\n"
-            f"Topic ID: "
-            f"{orders_topic['topic_id']}\n\n"
-        )
-
-    else:
-
-        text += (
-            "🆕 Новые заказы: ❌ не привязано\n\n"
-        )
-
-    if status_topic:
-
-        text += (
-            "🚚 Статусы: ✅\n"
-            f"Group ID: "
-            f"{status_topic['chat_id']}\n"
-            f"Topic ID: "
-            f"{status_topic['topic_id']}"
-        )
-
-    else:
-
-        text += (
-            "🚚 Статусы: ❌ не привязано"
-        )
-
-    await message.answer(text)
-
-
-@dp.message(F.text == "⬅️ Главное меню")
-async def back_main(
-    message: Message,
-    state: FSMContext,
-):
-
-    await state.clear()
-
-    await send_main_menu(message)
+    await message.answer(
+        "⚙️ НАСТРОЙКИ ГРУППЫ\n\n"
+        f"🏪 {membership['store_name']}\n\n"
+        f"📦 Новые заказы: {orders_status}\n"
+        f"🚚 Статусы/фото: {reports_status}"
+    )
 
 
 # =========================================================
