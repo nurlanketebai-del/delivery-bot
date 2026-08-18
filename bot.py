@@ -1,7 +1,10 @@
+Проверка кода GitHub
 import os
 import asyncio
 import secrets
 import string
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
 
 import asyncpg
@@ -40,6 +43,8 @@ def safe_int(value):
 
 
 ADMIN_ID = safe_int(ADMIN_ID_RAW)
+
+LOCAL_TZ = ZoneInfo("Asia/Almaty")
 
 
 if not TOKEN:
@@ -114,6 +119,7 @@ class OrderCreation(StatesGroup):
     documents = State()
 
     confirm = State()
+    schedule_time = State()
 
 
 class OrderEdit(StatesGroup):
@@ -291,7 +297,10 @@ order_confirm_keyboard = ReplyKeyboardMarkup(
         [
             KeyboardButton(
                 text="✅ Создать заказ"
-            )
+            ),
+            KeyboardButton(
+                text="🕒 Отправить позже"
+            ),
         ],
         [
             KeyboardButton(
@@ -504,6 +513,72 @@ async def init_db():
 
                 created_at TIMESTAMPTZ
                     NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+
+        # =================================================
+        # ОТЛОЖЕННЫЕ ЗАКАЗЫ
+        # =================================================
+
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_orders (
+                id SERIAL PRIMARY KEY,
+
+                store_id INTEGER NOT NULL
+                    REFERENCES stores(id)
+                    ON DELETE CASCADE,
+
+                client_name TEXT NOT NULL,
+                client_phone TEXT NOT NULL,
+                pickup_address TEXT NOT NULL,
+                delivery_address TEXT NOT NULL,
+                item TEXT NOT NULL,
+                kittek_order_number TEXT,
+                kaspi_order_number TEXT,
+                delivery_time TEXT NOT NULL,
+                comment TEXT,
+                created_by_telegram_id BIGINT NOT NULL,
+
+                scheduled_for TIMESTAMPTZ NOT NULL,
+                status TEXT NOT NULL DEFAULT 'scheduled',
+                created_order_id INTEGER
+                    REFERENCES orders(id)
+                    ON DELETE SET NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                processed_at TIMESTAMPTZ
+            )
+            """
+        )
+
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_scheduled_orders_due
+            ON scheduled_orders (scheduled_for)
+            WHERE status = 'scheduled'
+            """
+        )
+
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_order_documents (
+                id SERIAL PRIMARY KEY,
+
+                scheduled_order_id INTEGER NOT NULL
+                    REFERENCES scheduled_orders(id)
+                    ON DELETE CASCADE,
+
+                file_id TEXT NOT NULL,
+                file_name TEXT,
+                mime_type TEXT,
+                file_size BIGINT,
+
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """
         )
@@ -1124,6 +1199,282 @@ def build_order_text(
         f"🚚 Курьер: "
         f"{courier_name}"
     )
+
+
+def parse_scheduled_datetime(value: str):
+    """Parse manager-entered local date/time and return aware Asia/Almaty datetime."""
+
+    text = (value or "").strip()
+    now = datetime.now(LOCAL_TZ)
+
+    formats = [
+        "%d.%m.%Y %H:%M",
+        "%d.%m.%y %H:%M",
+        "%d.%m %H:%M",
+        "%H:%M",
+    ]
+
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+
+        if fmt == "%d.%m %H:%M":
+            parsed = parsed.replace(year=now.year)
+            aware = parsed.replace(tzinfo=LOCAL_TZ)
+            if aware <= now:
+                aware = aware.replace(year=now.year + 1)
+            return aware
+
+        if fmt == "%H:%M":
+            aware = now.replace(
+                hour=parsed.hour,
+                minute=parsed.minute,
+                second=0,
+                microsecond=0,
+            )
+            if aware <= now:
+                aware += timedelta(days=1)
+            return aware
+
+        return parsed.replace(tzinfo=LOCAL_TZ)
+
+    return None
+
+
+async def send_order_to_admin(order_id: int):
+    if not ADMIN_ID:
+        return
+
+    order = await get_order_full(order_id)
+    if not order:
+        return
+
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            build_order_text(
+                order,
+                title=f"🆕 НОВЫЙ ЗАКАЗ №{order_id}",
+            ),
+        )
+
+        documents = await get_order_documents(order_id)
+
+        for document in documents:
+            try:
+                await bot.send_document(
+                    chat_id=ADMIN_ID,
+                    document=document["file_id"],
+                    caption=(
+                        f"📎 Заказ №{order_id}\n"
+                        f"{document['file_name'] or 'Документ'}"
+                    ),
+                )
+            except Exception:
+                pass
+
+    except Exception as error:
+        print(
+            f"Could not send order #{order_id} to admin:",
+            error,
+        )
+
+
+async def publish_new_order(order_id: int):
+    order = await get_order_full(order_id)
+
+    if not order:
+        return
+
+    await send_store_topic_text(
+        order["store_id"],
+        "orders",
+        build_order_text(
+            order,
+            title=f"🆕 НОВЫЙ ЗАКАЗ №{order_id}",
+        ),
+    )
+
+    await send_order_documents_to_group(
+        order_id=order_id,
+        store_id=order["store_id"],
+    )
+
+    await send_order_to_admin(order_id)
+
+
+async def create_scheduled_order_now(scheduled_order_id: int):
+    """Atomically materialize one due scheduled order into the normal orders table."""
+
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            scheduled = await conn.fetchrow(
+                """
+                SELECT *
+                FROM scheduled_orders
+                WHERE id = $1
+                  AND status = 'scheduled'
+                  AND scheduled_for <= NOW()
+                FOR UPDATE
+                """,
+                scheduled_order_id,
+            )
+
+            if not scheduled:
+                return None
+
+            order_id = await conn.fetchval(
+                """
+                INSERT INTO orders (
+                    store_id,
+                    client_name,
+                    client_phone,
+                    pickup_address,
+                    delivery_address,
+                    item,
+                    kittek_order_number,
+                    kaspi_order_number,
+                    delivery_time,
+                    comment,
+                    created_by_telegram_id
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                RETURNING id
+                """,
+                scheduled["store_id"],
+                scheduled["client_name"],
+                scheduled["client_phone"],
+                scheduled["pickup_address"],
+                scheduled["delivery_address"],
+                scheduled["item"],
+                scheduled["kittek_order_number"],
+                scheduled["kaspi_order_number"],
+                scheduled["delivery_time"],
+                scheduled["comment"],
+                scheduled["created_by_telegram_id"],
+            )
+
+            documents = await conn.fetch(
+                """
+                SELECT file_id, file_name, mime_type, file_size
+                FROM scheduled_order_documents
+                WHERE scheduled_order_id = $1
+                ORDER BY id
+                """,
+                scheduled_order_id,
+            )
+
+            for document in documents:
+                await conn.execute(
+                    """
+                    INSERT INTO order_documents (
+                        order_id,
+                        file_id,
+                        file_name,
+                        mime_type,
+                        file_size
+                    )
+                    VALUES ($1,$2,$3,$4,$5)
+                    """,
+                    order_id,
+                    document["file_id"],
+                    document["file_name"],
+                    document["mime_type"],
+                    document["file_size"],
+                )
+
+            await add_history(
+                conn,
+                order_id,
+                "new",
+                "store",
+                scheduled["created_by_telegram_id"],
+                f"Отложенный заказ создан по расписанию #{scheduled_order_id}",
+            )
+
+            await conn.execute(
+                """
+                UPDATE scheduled_orders
+                SET status = 'completed',
+                    created_order_id = $2,
+                    processed_at = NOW(),
+                    last_error = NULL
+                WHERE id = $1
+                """,
+                scheduled_order_id,
+                order_id,
+            )
+
+    return (
+        order_id,
+        scheduled["created_by_telegram_id"],
+    )
+
+
+async def scheduled_orders_worker():
+    """Persistent worker: due jobs survive bot restarts because they live in PostgreSQL."""
+
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                due_ids = await conn.fetch(
+                    """
+                    SELECT id
+                    FROM scheduled_orders
+                    WHERE status = 'scheduled'
+                      AND scheduled_for <= NOW()
+                    ORDER BY scheduled_for, id
+                    LIMIT 20
+                    """
+                )
+
+            for row in due_ids:
+                try:
+                    result = await create_scheduled_order_now(row["id"])
+
+                    if not result:
+                        continue
+
+                    order_id, creator_id = result
+
+                    await publish_new_order(order_id)
+
+                    try:
+                        await bot.send_message(
+                            creator_id,
+                            f"✅ Отложенный заказ №{order_id} создан "
+                            "и отправлен по расписанию.",
+                        )
+                    except Exception:
+                        pass
+
+                except Exception as error:
+                    print(
+                        f"Scheduled order #{row['id']} failed:",
+                        error,
+                    )
+
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE scheduled_orders
+                            SET attempts = attempts + 1,
+                                last_error = $2
+                            WHERE id = $1
+                              AND status = 'scheduled'
+                            """,
+                            row["id"],
+                            str(error)[:1000],
+                        )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print("Scheduled orders worker error:", error)
+
+        await asyncio.sleep(15)
 
 
 async def send_main_menu(
@@ -3768,38 +4119,140 @@ async def order_confirm(
         reply_markup=store_keyboard,
     )
 
-    # =====================================================
-    # 1. СНАЧАЛА КАРТОЧКА ЗАКАЗА В ТЕМУ
-    # =====================================================
+    # ЕДИНАЯ ПУБЛИКАЦИЯ: ТЕМА МАГАЗИНА + ДОКУМЕНТЫ + АДМИН
+    await publish_new_order(order_id)
 
-    order = await get_order_full(
-        order_id
+
+@dp.message(
+    OrderCreation.confirm,
+    F.text == "🕒 Отправить позже",
+)
+async def order_schedule_start(
+    message: Message,
+    state: FSMContext,
+):
+    await state.set_state(OrderCreation.schedule_time)
+
+    now = datetime.now(LOCAL_TZ)
+
+    await message.answer(
+        "🕒 ОТЛОЖЕННЫЙ ЗАКАЗ\n\n"
+        "Укажите дату и время, когда заказ должен быть создан "
+        "и отправлен в группу и администратору.\n\n"
+        "Формат: ДД.ММ.ГГГГ ЧЧ:ММ\n"
+        "Например: 20.08.2026 14:30\n\n"
+        f"Сейчас: {now.strftime('%d.%m.%Y %H:%M')}",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
-    if order:
 
-        await send_store_topic_text(
-            order["store_id"],
-            "orders",
+@dp.message(OrderCreation.schedule_time)
+async def order_schedule_save(
+    message: Message,
+    state: FSMContext,
+):
+    scheduled_for = parse_scheduled_datetime(message.text)
+    now = datetime.now(LOCAL_TZ)
 
-            build_order_text(
-                order,
-
-                title=(
-                    f"🆕 НОВЫЙ ЗАКАЗ №"
-                    f"{order_id}"
-                ),
-            ),
+    if not scheduled_for:
+        await message.answer(
+            "❌ Не понял дату и время.\n\n"
+            "Введите так: 20.08.2026 14:30"
         )
+        return
 
-        # =================================================
-        # 2. СРАЗУ ПОСЛЕ КАРТОЧКИ — ВСЕ ДОКУМЕНТЫ
-        # =================================================
-
-        await send_order_documents_to_group(
-            order_id=order_id,
-            store_id=order["store_id"],
+    if scheduled_for <= now:
+        await message.answer(
+            "❌ Время должно быть в будущем.\n\n"
+            "Введите новую дату и время, например: "
+            "20.08.2026 14:30"
         )
+        return
+
+    data = await state.get_data()
+
+    membership = await get_store_membership(message.from_user.id)
+
+    if (
+        not membership
+        or membership["status"] != "approved"
+    ):
+        await state.clear()
+        await message.answer(
+            "❌ Магазин недоступен.",
+            reply_markup=store_keyboard,
+        )
+        return
+
+    documents = data.get("documents", [])
+
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            scheduled_id = await conn.fetchval(
+                """
+                INSERT INTO scheduled_orders (
+                    store_id,
+                    client_name,
+                    client_phone,
+                    pickup_address,
+                    delivery_address,
+                    item,
+                    kittek_order_number,
+                    kaspi_order_number,
+                    delivery_time,
+                    comment,
+                    created_by_telegram_id,
+                    scheduled_for
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                RETURNING id
+                """,
+                membership["store_id"],
+                data["client_name"],
+                data["client_phone"],
+                membership["address"],
+                data["delivery_address"],
+                data["item"],
+                data.get("kittek_order_number"),
+                data.get("kaspi_order_number"),
+                data["delivery_time"],
+                data["comment"],
+                message.from_user.id,
+                scheduled_for,
+            )
+
+            for document in documents:
+                await conn.execute(
+                    """
+                    INSERT INTO scheduled_order_documents (
+                        scheduled_order_id,
+                        file_id,
+                        file_name,
+                        mime_type,
+                        file_size
+                    )
+                    VALUES ($1,$2,$3,$4,$5)
+                    """,
+                    scheduled_id,
+                    document["file_id"],
+                    document.get("file_name"),
+                    document.get("mime_type"),
+                    document.get("file_size"),
+                )
+
+    await state.clear()
+
+    await message.answer(
+        f"✅ Отложенный заказ сохранён.\n\n"
+        f"🗓 Будет создан: "
+        f"{scheduled_for.strftime('%d.%m.%Y %H:%M')}\n"
+        f"📎 Документов: {len(documents)}\n\n"
+        "До этого времени он не попадёт в обычные заказы "
+        "и не будет отправлен в группу.\n"
+        "В указанное время бот создаст обычный заказ "
+        "и отправит его автоматически.",
+        reply_markup=store_keyboard,
+    )
 
 
 @dp.message(
@@ -8369,9 +8822,20 @@ async def main():
         "Bot is starting..."
     )
 
-    await dp.start_polling(
-        bot
+    scheduled_worker_task = asyncio.create_task(
+        scheduled_orders_worker()
     )
+
+    try:
+        await dp.start_polling(
+            bot
+        )
+    finally:
+        scheduled_worker_task.cancel()
+        try:
+            await scheduled_worker_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":
