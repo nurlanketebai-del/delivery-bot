@@ -2,6 +2,8 @@ import os
 import asyncio
 import secrets
 import string
+import re
+from urllib.parse import quote_plus
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
@@ -124,6 +126,12 @@ class OrderCreation(StatesGroup):
     schedule_time = State()
 
 
+
+class QuickOrderCreation(StatesGroup):
+    input_text = State()
+    confirm = State()
+    edit_value = State()
+
 class OrderEdit(StatesGroup):
     value = State()
 
@@ -233,6 +241,11 @@ store_keyboard = ReplyKeyboardMarkup(
         [
             KeyboardButton(
                 text="➕ Создать заказ"
+            )
+        ],
+        [
+            KeyboardButton(
+                text="⚡ Быстрый заказ"
             )
         ],
         [
@@ -812,6 +825,10 @@ async def init_db():
             """
         )
 
+        # =================================================
+        # KASPI — КОД ПОДТВЕРЖДЕНИЯ
+        # =================================================
+
         await conn.execute(
             """
             ALTER TABLE orders
@@ -820,10 +837,58 @@ async def init_db():
             """
         )
 
+        # =================================================
+        # ОДНО ЖИВОЕ СООБЩЕНИЕ СТАТУСОВ В ГРУППЕ
+        # =================================================
+
+        await conn.execute(
+            """
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS
+            status_group_message_id BIGINT
+            """
+        )
+
+        await conn.execute(
+            """
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS
+            status_group_chat_id BIGINT
+            """
+        )
+
+        await conn.execute(
+            """
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS
+            status_group_topic_id BIGINT
+            """
+        )
+
+        # =================================================
+        # УТРЕННЕЕ ВОССТАНОВЛЕНИЕ МЕНЮ
+        # =================================================
+
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS morning_menu_deliveries (
+                send_date DATE NOT NULL,
+                telegram_id BIGINT NOT NULL,
+                sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (send_date, telegram_id)
+            )
+            """
+        )
+
+        # =================================================
+        # ОТЧЁТЫ КУРЬЕРА — ФОТО И ВИДЕО
+        # =================================================
+
         await conn.execute(
             """
             ALTER TABLE order_photos
-            ADD COLUMN IF NOT EXISTS media_type TEXT
+            ADD COLUMN IF NOT EXISTS
+            media_type TEXT
             NOT NULL DEFAULT 'photo'
             """
         )
@@ -1592,7 +1657,12 @@ async def postpone_existing_order(
         f"{scheduled_for.strftime('%d.%m.%Y %H:%M')}.",
     )
 
+    await update_store_status_message(
+        order_id
+    )
+
     return order
+
 
 
 async def release_postponed_orders():
@@ -1992,6 +2062,288 @@ async def send_store_topic_text(
         )
 
 
+
+# =========================================================
+# ОДНО ЖИВОЕ СООБЩЕНИЕ СТАТУСОВ НА КАЖДЫЙ ЗАКАЗ
+# =========================================================
+
+def status_history_line(
+    status: str,
+    note,
+    order,
+):
+
+    note_text = (
+        str(note).strip()
+        if note
+        else ""
+    )
+
+    if (
+        note_text
+        and "разрешил продолжить" in note_text.lower()
+    ):
+        return "▶️ Проблема решена, доставка продолжается"
+
+    if status == "assigned":
+        if "измен" in note_text.lower():
+            return f"🔄 {note_text}"
+        if note_text:
+            return f"🚚 {note_text}"
+        return "🚚 Курьер назначен"
+
+    if status == "accepted":
+        return "✅ Курьер принял заказ"
+
+    if status == "pickup_photo":
+        return "📸🎥 Отчёт при получении сохранён"
+
+    if status == "picked_up":
+        return "📦 Курьер получил товар"
+
+    if status == "on_the_way":
+        return "🚗 Курьер выехал к клиенту"
+
+    if status == "arrived":
+        return "📍 Курьер приехал к клиенту"
+
+    if status == "kaspi_code":
+        code = (
+            order["kaspi_confirmation_code"]
+            or ""
+        ).strip()
+
+        if code:
+            return (
+                "🔐 Код Kaspi получен: "
+                f"{code}"
+            )
+
+        return "🔐 Код Kaspi получен"
+
+    if status == "delivery_photo":
+        return "📸🎥 Отчёт доставки сохранён"
+
+    if status == "delivered":
+        return "✅ Заказ доставлен"
+
+    if status == "cancelled":
+        return "❌ Заказ отменён"
+
+    if status == "postponed":
+        if note_text:
+            return f"🗓 {note_text}"
+        return "🗓 Заказ перенесён"
+
+    if status == "problem":
+        if note_text:
+            return f"⚠️ {note_text}"
+        return "⚠️ Возникла проблема с заказом"
+
+    return None
+
+
+
+async def build_store_status_timeline(
+    order_id: int,
+):
+
+    async with db_pool.acquire() as conn:
+
+        order = await conn.fetchrow(
+            """
+            SELECT
+                o.*,
+                s.store_name,
+                c.full_name AS courier_name
+
+            FROM orders o
+
+            JOIN stores s
+                ON s.id = o.store_id
+
+            LEFT JOIN couriers c
+                ON c.id = o.courier_id
+
+            WHERE o.id = $1
+            """,
+            order_id,
+        )
+
+        if not order:
+            return None, None
+
+        history = await conn.fetch(
+            """
+            SELECT
+                status,
+                note,
+                created_at
+
+            FROM order_status_history
+
+            WHERE order_id = $1
+
+            ORDER BY
+                created_at ASC,
+                id ASC
+            """,
+            order_id,
+        )
+
+    lines = []
+
+    for row in history:
+
+        line = status_history_line(
+            row["status"],
+            row["note"],
+            order,
+        )
+
+        if (
+            line
+            and line not in lines
+        ):
+            lines.append(
+                line
+            )
+
+    if not lines:
+        return order, None
+
+    text = (
+        f"📦 СТАТУС ЗАКАЗА №{order_id}\n\n"
+        f"🔢 Kittek №: "
+        f"{optional_number(order['kittek_order_number'])}\n"
+        f"🛒 Kaspi №: "
+        f"{optional_number(order['kaspi_order_number'])}\n"
+        f"👤 Клиент: "
+        f"{order['client_name']}\n"
+        f"📍 {order['delivery_address']}\n\n"
+        + "\n".join(lines)
+    )
+
+    return order, text
+
+
+async def update_store_status_message(
+    order_id: int,
+):
+
+    order, text = await build_store_status_timeline(
+        order_id
+    )
+
+    if (
+        not order
+        or not text
+    ):
+        return
+
+    settings = await get_store_report_settings(
+        order["store_id"]
+    )
+
+    if not settings:
+        return
+
+    chat_id = settings[
+        "group_chat_id"
+    ]
+
+    topic_id = settings[
+        "status_topic_id"
+    ]
+
+    if (
+        not chat_id
+        or not topic_id
+    ):
+        return
+
+    saved_message_id = order[
+        "status_group_message_id"
+    ]
+
+    same_place = (
+        saved_message_id
+        and order[
+            "status_group_chat_id"
+        ] == chat_id
+        and order[
+            "status_group_topic_id"
+        ] == topic_id
+    )
+
+    if same_place:
+
+        try:
+
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=saved_message_id,
+                text=text,
+            )
+
+            return
+
+        except Exception as error:
+
+            error_text = str(
+                error
+            ).lower()
+
+            if (
+                "message is not modified"
+                in error_text
+            ):
+                return
+
+            print(
+                "STATUS MESSAGE EDIT ERROR:",
+                order_id,
+                error,
+            )
+
+    try:
+
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=topic_id,
+            text=text,
+        )
+
+    except Exception as error:
+
+        print(
+            "STATUS MESSAGE SEND ERROR:",
+            order_id,
+            error,
+        )
+
+        return
+
+    async with db_pool.acquire() as conn:
+
+        await conn.execute(
+            """
+            UPDATE orders
+
+            SET
+                status_group_message_id = $1,
+                status_group_chat_id = $2,
+                status_group_topic_id = $3,
+                updated_at = NOW()
+
+            WHERE id = $4
+            """,
+            sent.message_id,
+            chat_id,
+            topic_id,
+            order_id,
+        )
+
 async def send_store_topic_photo(
     store_id: int,
     photo_file_id: str,
@@ -2037,6 +2389,7 @@ async def send_store_topic_photo(
         )
 
 
+
 async def send_store_topic_video(
     store_id: int,
     video_file_id: str,
@@ -2050,20 +2403,31 @@ async def send_store_topic_video(
     if not settings:
         return
 
-    chat_id = settings["group_chat_id"]
-    topic_id = settings["status_topic_id"]
+    chat_id = settings[
+        "group_chat_id"
+    ]
 
-    if not chat_id or not topic_id:
+    topic_id = settings[
+        "status_topic_id"
+    ]
+
+    if (
+        not chat_id
+        or not topic_id
+    ):
         return
 
     try:
+
         await bot.send_video(
             chat_id=chat_id,
             message_thread_id=topic_id,
             video=video_file_id,
             caption=caption,
         )
+
     except Exception as error:
+
         print(
             "STORE GROUP VIDEO ERROR:",
             store_id,
@@ -2236,10 +2600,15 @@ async def build_status_report(
         f"{courier}"
     )
 
+
+
 def courier_order_keyboard(
     order_id: int,
     status: str,
     has_kaspi: bool = False,
+    client_phone=None,
+    delivery_address=None,
+    can_work: bool = True,
 ):
 
     buttons = []
@@ -2250,7 +2619,7 @@ def courier_order_keyboard(
             f"accept_order:{order_id}",
         ),
         "accepted": (
-            "📸 Фото/видео товара при получении",
+            "📸🎥 Отчёт при получении",
             f"pickup_photo:{order_id}",
         ),
         "pickup_photo": (
@@ -2266,11 +2635,19 @@ def courier_order_keyboard(
             f"arrived:{order_id}",
         ),
         "arrived": (
-            "🔐 Ввести код Kaspi" if has_kaspi else "📸 Фото/видео доставки",
-            f"kaspi_code:{order_id}" if has_kaspi else f"delivery_photo:{order_id}",
+            (
+                "🔐 Ввести код Kaspi"
+                if has_kaspi
+                else "📸🎥 Отчёт доставки"
+            ),
+            (
+                f"kaspi_code:{order_id}"
+                if has_kaspi
+                else f"delivery_photo:{order_id}"
+            ),
         ),
         "kaspi_code": (
-            "📸 Фото/видео доставки",
+            "📸🎥 Отчёт доставки",
             f"delivery_photo:{order_id}",
         ),
         "delivery_photo": (
@@ -2279,8 +2656,14 @@ def courier_order_keyboard(
         ),
     }
 
-    if status in action_map:
-        text, callback_data = action_map[status]
+    if (
+        can_work
+        and status in action_map
+    ):
+
+        text, callback_data = action_map[
+            status
+        ]
 
         buttons.append([
             InlineKeyboardButton(
@@ -2292,16 +2675,59 @@ def courier_order_keyboard(
         buttons.append([
             InlineKeyboardButton(
                 text="⚠️ Проблема с заказом",
-                callback_data=f"order_problem:{order_id}",
+                callback_data=(
+                    f"order_problem:{order_id}"
+                ),
             )
         ])
 
-    if not buttons:
-        return None
+    utility_row = []
+
+    if client_phone:
+
+        utility_row.append(
+            InlineKeyboardButton(
+                text="📞 Позвонить",
+                callback_data=(
+                    f"call_client:{order_id}"
+                ),
+            )
+        )
+
+    if delivery_address:
+
+        route_url = (
+            "https://www.google.com/maps/dir/"
+            "?api=1&destination="
+            + quote_plus(
+                delivery_address
+            )
+        )
+
+        utility_row.append(
+            InlineKeyboardButton(
+                text="🗺 Маршрут",
+                url=route_url,
+            )
+        )
+
+    if utility_row:
+        buttons.append(
+            utility_row
+        )
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="📋 Вся очередь",
+            callback_data="courier_full_queue",
+        )
+    ])
 
     return InlineKeyboardMarkup(
         inline_keyboard=buttons
     )
+
+
 
 
 async def get_courier_order_card(
@@ -2393,10 +2819,34 @@ async def get_courier_order_card(
         f"{problem_text}"
     )
 
+    can_work = (
+        bool(
+            queue_info["position"]
+        )
+        and queue_info[
+            "position"
+        ] == 1
+        and order[
+            "status"
+        ] in QUEUE_ACTIVE_STATUSES
+    )
+
     keyboard = courier_order_keyboard(
         order_id,
         order["status"],
-        bool((order["kaspi_order_number"] or "").strip()),
+        bool(
+            (
+                order["kaspi_order_number"]
+                or ""
+            ).strip()
+        ),
+        client_phone=order[
+            "client_phone"
+        ],
+        delivery_address=order[
+            "delivery_address"
+        ],
+        can_work=can_work,
     )
 
     return text, keyboard
@@ -2461,6 +2911,209 @@ async def send_courier_order_card(
             error,
         )
 
+
+
+# =========================================================
+# ЕЖЕДНЕВНОЕ ВОССТАНОВЛЕНИЕ КЛАВИАТУРЫ
+# =========================================================
+
+async def get_morning_menu_users():
+
+    users = {}
+
+    async with db_pool.acquire() as conn:
+
+        store_users = await conn.fetch(
+            """
+            SELECT
+                su.telegram_id
+
+            FROM store_users su
+
+            JOIN stores s
+                ON s.id = su.store_id
+
+            WHERE s.status = 'approved'
+            """
+        )
+
+        courier_users = await conn.fetch(
+            """
+            SELECT
+                telegram_id
+
+            FROM couriers
+
+            WHERE status = 'approved'
+            """
+        )
+
+    for row in store_users:
+        users[
+            int(row["telegram_id"])
+        ] = "store"
+
+    for row in courier_users:
+        users.setdefault(
+            int(row["telegram_id"]),
+            "courier",
+        )
+
+    if ADMIN_ID:
+        users.setdefault(
+            ADMIN_ID,
+            None,
+        )
+
+    return users
+
+
+async def send_morning_menu_once():
+
+    now = datetime.now(
+        LOCAL_TZ
+    )
+
+    if (
+        now.hour < 9
+        or now.hour >= 12
+    ):
+        return
+
+    send_date = now.date()
+
+    users = await get_morning_menu_users()
+
+    for user_id, fallback_role in users.items():
+
+        async with db_pool.acquire() as conn:
+
+            already_sent = await conn.fetchval(
+                """
+                SELECT EXISTS(
+                    SELECT 1
+
+                    FROM morning_menu_deliveries
+
+                    WHERE send_date = $1
+                      AND telegram_id = $2
+                )
+                """,
+                send_date,
+                user_id,
+            )
+
+        if already_sent:
+            continue
+
+        try:
+
+            role, info = await get_user_role(
+                user_id
+            )
+
+            role = (
+                role
+                or fallback_role
+            )
+
+            if is_admin(
+                user_id
+            ):
+
+                keyboard = main_keyboard(
+                    role,
+                    user_id,
+                )
+
+            elif (
+                role == "store"
+                and info
+                and info[
+                    "status"
+                ] == "approved"
+            ):
+
+                keyboard = store_keyboard
+
+            elif (
+                role == "courier"
+                and info
+                and info[
+                    "status"
+                ] == "approved"
+            ):
+
+                keyboard = courier_keyboard
+
+            else:
+                continue
+
+            await bot.send_message(
+                user_id,
+                "☀️ Доброе утро!\n\n"
+                "Система доставки готова к работе.\n"
+                "Ниже восстановлено актуальное меню.\n\n"
+                "Если кнопки отображаются неправильно — "
+                "отправьте /start.",
+                reply_markup=keyboard,
+            )
+
+            async with db_pool.acquire() as conn:
+
+                await conn.execute(
+                    """
+                    INSERT INTO morning_menu_deliveries (
+                        send_date,
+                        telegram_id
+                    )
+
+                    VALUES ($1,$2)
+
+                    ON CONFLICT (
+                        send_date,
+                        telegram_id
+                    )
+                    DO NOTHING
+                    """,
+                    send_date,
+                    user_id,
+                )
+
+        except Exception as error:
+
+            print(
+                "MORNING MENU ERROR:",
+                user_id,
+                error,
+            )
+
+
+async def morning_menu_worker():
+
+    print(
+        "Morning menu worker started."
+    )
+
+    while True:
+
+        try:
+
+            await send_morning_menu_once()
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as error:
+
+            print(
+                "MORNING MENU WORKER ERROR:",
+                error,
+            )
+
+        await asyncio.sleep(
+            60
+        )
 
 # =========================================================
 # START
@@ -4063,6 +4716,1004 @@ async def store_statistics(
         f"{price_text(stats['total_price'])}"
     )
 
+
+
+# =========================================================
+# БЫСТРЫЙ ЗАКАЗ ТЕКСТОМ
+# =========================================================
+
+def clean_quick_value(
+    value,
+):
+
+    if value is None:
+        return None
+
+    value = str(
+        value
+    ).strip()
+
+    return (
+        value
+        if value
+        else None
+    )
+
+
+def parse_quick_order_text(
+    text: str,
+):
+
+    raw_lines = [
+        line.strip()
+        for line in (
+            text
+            or ""
+        ).splitlines()
+        if line.strip()
+    ]
+
+    result = {
+        "client_name": None,
+        "client_phone": None,
+        "delivery_address": None,
+        "item": None,
+        "kittek_order_number": None,
+        "kaspi_order_number": None,
+        "delivery_time": "-",
+        "comment": None,
+    }
+
+    used = set()
+
+    phone_pattern = re.compile(
+        r"(?:(?:\+?7|8)"
+        r"[\s\-\(\)]*"
+        r"\d(?:[\s\-\(\)]*\d){9})"
+    )
+
+    for index, line in enumerate(
+        raw_lines
+    ):
+
+        lower = line.lower()
+
+        if (
+            (
+                "kittek" in lower
+                or "киттек" in lower
+            )
+            and result[
+                "kittek_order_number"
+            ] is None
+        ):
+
+            value = re.sub(
+                r"(?i).*?(?:kittek|киттек)"
+                r"\s*(?:№|номер)?\s*[:\-]?\s*",
+                "",
+                line,
+            ).strip()
+
+            result[
+                "kittek_order_number"
+            ] = clean_quick_value(
+                value
+            )
+
+            used.add(
+                index
+            )
+
+            continue
+
+        if (
+            (
+                "kaspi" in lower
+                or "каспи" in lower
+            )
+            and result[
+                "kaspi_order_number"
+            ] is None
+        ):
+
+            value = re.sub(
+                r"(?i).*?(?:kaspi|каспи)"
+                r"\s*(?:№|номер)?\s*[:\-]?\s*",
+                "",
+                line,
+            ).strip()
+
+            result[
+                "kaspi_order_number"
+            ] = clean_quick_value(
+                value
+            )
+
+            used.add(
+                index
+            )
+
+            continue
+
+        if lower.startswith(
+            (
+                "адрес:",
+                "доставить:",
+                "доставка:",
+            )
+        ):
+
+            value = line.split(
+                ":",
+                1,
+            )[1].strip()
+
+            result[
+                "delivery_address"
+            ] = clean_quick_value(
+                value
+            )
+
+            used.add(
+                index
+            )
+
+            continue
+
+        if lower.startswith(
+            "время:"
+        ):
+
+            value = line.split(
+                ":",
+                1,
+            )[1].strip()
+
+            result[
+                "delivery_time"
+            ] = (
+                value
+                or "-"
+            )
+
+            used.add(
+                index
+            )
+
+            continue
+
+        if lower.startswith(
+            (
+                "комментарий:",
+                "коммент:",
+            )
+        ):
+
+            value = line.split(
+                ":",
+                1,
+            )[1].strip()
+
+            result[
+                "comment"
+            ] = clean_quick_value(
+                value
+            )
+
+            used.add(
+                index
+            )
+
+            continue
+
+        if lower.startswith(
+            (
+                "товар:",
+                "модель:",
+            )
+        ):
+
+            value = line.split(
+                ":",
+                1,
+            )[1].strip()
+
+            result[
+                "item"
+            ] = clean_quick_value(
+                value
+            )
+
+            used.add(
+                index
+            )
+
+            continue
+
+        if lower.startswith(
+            "клиент:"
+        ):
+
+            value = line.split(
+                ":",
+                1,
+            )[1].strip()
+
+            result[
+                "client_name"
+            ] = clean_quick_value(
+                value
+            )
+
+            used.add(
+                index
+            )
+
+            continue
+
+        phone_match = phone_pattern.search(
+            line
+        )
+
+        if (
+            phone_match
+            and result[
+                "client_phone"
+            ] is None
+        ):
+
+            phone = phone_match.group(
+                0
+            ).strip()
+
+            result[
+                "client_phone"
+            ] = phone
+
+            name = (
+                line[
+                    :phone_match.start()
+                ]
+                + " "
+                + line[
+                    phone_match.end():
+                ]
+            ).strip(
+                " ,-—;:"
+            )
+
+            if (
+                name
+                and result[
+                    "client_name"
+                ] is None
+            ):
+
+                result[
+                    "client_name"
+                ] = name
+
+            used.add(
+                index
+            )
+
+    for index, line in enumerate(
+        raw_lines
+    ):
+
+        if index in used:
+            continue
+
+        compact = re.sub(
+            r"\s+",
+            "",
+            line,
+        )
+
+        if (
+            result[
+                "kittek_order_number"
+            ] is None
+            and re.fullmatch(
+                r"\d{3,8}",
+                compact,
+            )
+        ):
+
+            result[
+                "kittek_order_number"
+            ] = compact
+
+            used.add(
+                index
+            )
+
+            continue
+
+        if (
+            result[
+                "kaspi_order_number"
+            ] is None
+            and re.fullmatch(
+                r"\d{9,16}",
+                compact,
+            )
+        ):
+
+            result[
+                "kaspi_order_number"
+            ] = compact
+
+            used.add(
+                index
+            )
+
+            continue
+
+    for index, line in enumerate(
+        raw_lines
+    ):
+
+        if index in used:
+            continue
+
+        if (
+            result[
+                "item"
+            ] is None
+        ):
+
+            result[
+                "item"
+            ] = line
+
+            used.add(
+                index
+            )
+
+            break
+
+    remaining = [
+        line
+        for index, line in enumerate(
+            raw_lines
+        )
+        if index not in used
+    ]
+
+    if (
+        remaining
+        and result[
+            "comment"
+        ] is None
+    ):
+
+        result[
+            "comment"
+        ] = "\n".join(
+            remaining
+        )
+
+    if not result[
+        "client_name"
+    ]:
+
+        result[
+            "client_name"
+        ] = "Не указан"
+
+    if not result[
+        "comment"
+    ]:
+
+        result[
+            "comment"
+        ] = "Нет"
+
+    return result
+
+
+def quick_order_preview_text(
+    data: dict,
+    membership,
+):
+
+    return (
+        "⚡ БЫСТРЫЙ ЗАКАЗ — ПРОВЕРКА\n\n"
+        f"🔢 Kittek №: "
+        f"{optional_number(data.get('kittek_order_number'))}\n"
+        f"🛒 Kaspi №: "
+        f"{optional_number(data.get('kaspi_order_number'))}\n\n"
+        f"🏪 Магазин: "
+        f"{membership['store_name']}\n"
+        f"👤 Создал: "
+        f"{membership['full_name']}\n"
+        f"📍 Забрать: "
+        f"{membership['address']}\n\n"
+        f"👤 Клиент: "
+        f"{data.get('client_name') or '—'}\n"
+        f"📞 "
+        f"{data.get('client_phone') or '—'}\n"
+        f"📍 Доставить: "
+        f"{data.get('delivery_address') or '—'}\n\n"
+        f"📦 "
+        f"{data.get('item') or '—'}\n"
+        f"🕐 "
+        f"{data.get('delivery_time') or '-'}\n"
+        f"📝 "
+        f"{data.get('comment') or 'Нет'}"
+    )
+
+
+def quick_order_confirm_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Всё верно",
+                    callback_data=(
+                        "quick_order_confirm"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✏️ Исправить",
+                    callback_data=(
+                        "quick_order_edit_menu"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data=(
+                        "quick_order_cancel"
+                    ),
+                )
+            ],
+        ]
+    )
+
+
+@dp.message(
+    F.text == "⚡ Быстрый заказ"
+)
+async def quick_order_start(
+    message: Message,
+    state: FSMContext,
+):
+
+    membership = await get_store_membership(
+        message.from_user.id
+    )
+
+    if (
+        not membership
+        or membership[
+            "status"
+        ] != "approved"
+    ):
+
+        await message.answer(
+            "❌ Быстрый заказ доступен "
+            "только одобренному магазину."
+        )
+
+        return
+
+    await state.clear()
+
+    await state.set_state(
+        QuickOrderCreation.input_text
+    )
+
+    await message.answer(
+        "⚡ БЫСТРЫЙ ЗАКАЗ\n\n"
+        "Отправьте весь заказ одним сообщением.\n\n"
+        "Например:\n"
+        "18607\n\n"
+        "MW820DHSBK\n\n"
+        "Адрес: Щепкина 42 кв 99, "
+        "3 подъезд, 4 этаж\n\n"
+        "+7 705 244 2975 Альмира\n\n"
+        "Без кода, заранее позвонить\n\n"
+        "Бот распознает поля и обязательно "
+        "покажет карточку перед созданием.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@dp.message(
+    QuickOrderCreation.input_text
+)
+async def quick_order_receive(
+    message: Message,
+    state: FSMContext,
+):
+
+    text = (
+        message.text
+        or ""
+    ).strip()
+
+    if not text:
+
+        await message.answer(
+            "❌ Отправьте заказ текстом."
+        )
+
+        return
+
+    membership = await get_store_membership(
+        message.from_user.id
+    )
+
+    if not membership:
+
+        await state.clear()
+
+        await message.answer(
+            "❌ Магазин не найден."
+        )
+
+        return
+
+    parsed = parse_quick_order_text(
+        text
+    )
+
+    await state.update_data(
+        quick_order=parsed
+    )
+
+    await state.set_state(
+        QuickOrderCreation.confirm
+    )
+
+    await message.answer(
+        quick_order_preview_text(
+            parsed,
+            membership,
+        ),
+        reply_markup=(
+            quick_order_confirm_keyboard()
+        ),
+    )
+
+
+@dp.callback_query(
+    F.data == "quick_order_edit_menu"
+)
+async def quick_order_edit_menu(
+    callback: CallbackQuery,
+):
+
+    fields = [
+        (
+            "🔢 Kittek №",
+            "kittek_order_number",
+        ),
+        (
+            "🛒 Kaspi №",
+            "kaspi_order_number",
+        ),
+        (
+            "👤 Клиент",
+            "client_name",
+        ),
+        (
+            "📞 Телефон",
+            "client_phone",
+        ),
+        (
+            "📍 Адрес",
+            "delivery_address",
+        ),
+        (
+            "📦 Товар",
+            "item",
+        ),
+        (
+            "🕐 Время",
+            "delivery_time",
+        ),
+        (
+            "📝 Комментарий",
+            "comment",
+        ),
+    ]
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=title,
+                callback_data=(
+                    f"quick_order_edit:"
+                    f"{field}"
+                ),
+            )
+        ]
+        for title, field in fields
+    ]
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="↩️ Назад",
+            callback_data=(
+                "quick_order_preview"
+            ),
+        )
+    ])
+
+    await callback.message.answer(
+        "✏️ Что изменить?",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        ),
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data.startswith(
+        "quick_order_edit:"
+    )
+)
+async def quick_order_edit_field(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    field = callback.data.split(
+        ":",
+        1,
+    )[1]
+
+    allowed = {
+        "kittek_order_number",
+        "kaspi_order_number",
+        "client_name",
+        "client_phone",
+        "delivery_address",
+        "item",
+        "delivery_time",
+        "comment",
+    }
+
+    if field not in allowed:
+
+        await callback.answer(
+            "Неизвестное поле.",
+            show_alert=True,
+        )
+
+        return
+
+    await state.update_data(
+        quick_edit_field=field
+    )
+
+    await state.set_state(
+        QuickOrderCreation.edit_value
+    )
+
+    await callback.message.answer(
+        "✏️ Введите новое значение.\n\n"
+        "Для Kittek/Kaspi можно написать «-», "
+        "чтобы очистить поле."
+    )
+
+    await callback.answer()
+
+
+@dp.message(
+    QuickOrderCreation.edit_value
+)
+async def quick_order_edit_value(
+    message: Message,
+    state: FSMContext,
+):
+
+    value = (
+        message.text
+        or ""
+    ).strip()
+
+    data = await state.get_data()
+
+    field = data.get(
+        "quick_edit_field"
+    )
+
+    quick_order = data.get(
+        "quick_order",
+        {},
+    )
+
+    if not field:
+
+        await state.clear()
+
+        await message.answer(
+            "❌ Ошибка редактирования."
+        )
+
+        return
+
+    if (
+        field in {
+            "kittek_order_number",
+            "kaspi_order_number",
+        }
+        and value.lower()
+        in {
+            "-",
+            "нет",
+            "none",
+        }
+    ):
+
+        value = None
+
+    elif not value:
+
+        await message.answer(
+            "❌ Значение не может "
+            "быть пустым."
+        )
+
+        return
+
+    quick_order[
+        field
+    ] = value
+
+    await state.update_data(
+        quick_order=quick_order,
+        quick_edit_field=None,
+    )
+
+    await state.set_state(
+        QuickOrderCreation.confirm
+    )
+
+    membership = await get_store_membership(
+        message.from_user.id
+    )
+
+    await message.answer(
+        quick_order_preview_text(
+            quick_order,
+            membership,
+        ),
+        reply_markup=(
+            quick_order_confirm_keyboard()
+        ),
+    )
+
+
+@dp.callback_query(
+    F.data == "quick_order_preview"
+)
+async def quick_order_preview(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    data = await state.get_data()
+
+    quick_order = data.get(
+        "quick_order"
+    )
+
+    membership = await get_store_membership(
+        callback.from_user.id
+    )
+
+    if (
+        not quick_order
+        or not membership
+    ):
+
+        await callback.answer(
+            "Данные быстрого заказа "
+            "не найдены.",
+            show_alert=True,
+        )
+
+        return
+
+    await state.set_state(
+        QuickOrderCreation.confirm
+    )
+
+    await callback.message.answer(
+        quick_order_preview_text(
+            quick_order,
+            membership,
+        ),
+        reply_markup=(
+            quick_order_confirm_keyboard()
+        ),
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data == "quick_order_cancel"
+)
+async def quick_order_cancel(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    await state.clear()
+
+    await callback.message.answer(
+        "❌ Быстрый заказ отменён.",
+        reply_markup=store_keyboard,
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data == "quick_order_confirm"
+)
+async def quick_order_confirm(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    data = await state.get_data()
+
+    quick_order = data.get(
+        "quick_order"
+    )
+
+    membership = await get_store_membership(
+        callback.from_user.id
+    )
+
+    if (
+        not quick_order
+        or not membership
+        or membership[
+            "status"
+        ] != "approved"
+    ):
+
+        await callback.answer(
+            "Данные заказа недоступны.",
+            show_alert=True,
+        )
+
+        return
+
+    missing = []
+
+    if not quick_order.get(
+        "client_phone"
+    ):
+        missing.append(
+            "телефон клиента"
+        )
+
+    if not quick_order.get(
+        "delivery_address"
+    ):
+        missing.append(
+            "адрес доставки"
+        )
+
+    if not quick_order.get(
+        "item"
+    ):
+        missing.append(
+            "товар"
+        )
+
+    if missing:
+
+        await callback.answer(
+            "Заполните: "
+            + ", ".join(
+                missing
+            ),
+            show_alert=True,
+        )
+
+        return
+
+    async with db_pool.acquire() as conn:
+
+        async with conn.transaction():
+
+            order_id = await conn.fetchval(
+                """
+                INSERT INTO orders (
+                    store_id,
+                    client_name,
+                    client_phone,
+                    pickup_address,
+                    delivery_address,
+                    item,
+                    kittek_order_number,
+                    kaspi_order_number,
+                    delivery_time,
+                    comment,
+                    created_by_telegram_id
+                )
+
+                VALUES (
+                    $1,$2,$3,$4,$5,$6,
+                    $7,$8,$9,$10,$11
+                )
+
+                RETURNING id
+                """,
+                membership[
+                    "store_id"
+                ],
+                quick_order.get(
+                    "client_name"
+                ) or "Не указан",
+                quick_order[
+                    "client_phone"
+                ],
+                membership[
+                    "address"
+                ],
+                quick_order[
+                    "delivery_address"
+                ],
+                quick_order[
+                    "item"
+                ],
+                quick_order.get(
+                    "kittek_order_number"
+                ),
+                quick_order.get(
+                    "kaspi_order_number"
+                ),
+                quick_order.get(
+                    "delivery_time"
+                ) or "-",
+                quick_order.get(
+                    "comment"
+                ) or "Нет",
+                callback.from_user.id,
+            )
+
+            await add_history(
+                conn,
+                order_id,
+                "new",
+                "store",
+                callback.from_user.id,
+                "Заказ создан быстрым вводом",
+            )
+
+    await state.clear()
+
+    await callback.message.answer(
+        f"✅ Заказ №{order_id} создан "
+        "быстрым вводом.",
+        reply_markup=store_keyboard,
+    )
+
+    await publish_new_order(
+        order_id
+    )
+
+    await callback.answer(
+        "Заказ создан."
+    )
 
 # =========================================================
 # СОЗДАНИЕ ЗАКАЗА
@@ -5892,6 +7543,7 @@ async def courier_statistics(
 # МОИ ДОСТАВКИ
 # =========================================================
 
+
 @dp.message(
     F.text == "📦 Мои доставки"
 )
@@ -5919,54 +7571,376 @@ async def courier_orders(
             courier_id,
         )
 
-        orders = await conn.fetch(
+        next_order = await conn.fetchrow(
             """
-            SELECT id
+            SELECT
+                id,
+                queue_position
 
             FROM orders
 
             WHERE courier_id = $1
-              AND status NOT IN (
-                  'delivered',
-                  'cancelled',
-                  'postponed'
-              )
+              AND status = ANY($2::text[])
 
             ORDER BY
-                CASE
-                    WHEN status = 'problem'
-                    THEN 1
-                    ELSE 0
-                END,
-                COALESCE(queue_position, 2147483647),
+                queue_position,
                 id
+
+            LIMIT 1
+            """,
+            courier_id,
+            list(
+                QUEUE_ACTIVE_STATUSES
+            ),
+        )
+
+        total_active = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+
+            FROM orders
+
+            WHERE courier_id = $1
+              AND status = ANY($2::text[])
+            """,
+            courier_id,
+            list(
+                QUEUE_ACTIVE_STATUSES
+            ),
+        )
+
+        problem_count = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+
+            FROM orders
+
+            WHERE courier_id = $1
+              AND status = 'problem'
             """,
             courier_id,
         )
 
-    if not orders:
+    if not next_order:
 
-        await message.answer(
-            "📦 У вас пока нет "
-            "активных доставок."
-        )
+        if problem_count:
+
+            await message.answer(
+                "⚠️ В рабочей очереди сейчас "
+                "нет следующей доставки.\n\n"
+                f"Проблемных заказов: "
+                f"{problem_count}",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="📋 Вся очередь",
+                                callback_data=(
+                                    "courier_full_queue"
+                                ),
+                            )
+                        ]
+                    ]
+                ),
+            )
+
+        else:
+
+            await message.answer(
+                "📦 У вас пока нет "
+                "активных доставок."
+            )
 
         return
 
     await message.answer(
-        "📋 ВАША ОЧЕРЕДЬ ДОСТАВОК\n\n"
-        "Заказы показаны в порядке выполнения.\n"
-        "⚠️ Проблемные заказы отображаются отдельно "
-        "и не блокируют очередь."
+        "🟢 СЛЕДУЮЩАЯ ДОСТАВКА\n\n"
+        f"Это заказ №1 из "
+        f"{int(total_active or 0)} "
+        "в вашей текущей очереди.\n"
+        f"После него останется: "
+        f"{max(int(total_active or 0) - 1, 0)}"
     )
+
+    await send_courier_order_card(
+        message.from_user.id,
+        next_order["id"],
+    )
+
+
+
+
+# =========================================================
+# КУРЬЕР — ЗВОНОК / ВСЯ ОЧЕРЕДЬ / ПРОСМОТР ЗАКАЗА
+# =========================================================
+
+@dp.callback_query(
+    F.data.startswith(
+        "call_client:"
+    )
+)
+async def courier_call_client(
+    callback: CallbackQuery
+):
+
+    order_id = int(
+        callback.data.split(":")[1]
+    )
+
+    courier_id = await get_approved_courier_id(
+        callback.from_user.id
+    )
+
+    if not courier_id:
+
+        await callback.answer(
+            "Курьер не найден.",
+            show_alert=True,
+        )
+
+        return
+
+    async with db_pool.acquire() as conn:
+
+        order = await conn.fetchrow(
+            """
+            SELECT
+                client_name,
+                client_phone
+
+            FROM orders
+
+            WHERE id = $1
+              AND courier_id = $2
+              AND status NOT IN (
+                    'delivered',
+                    'cancelled',
+                    'postponed'
+                  )
+            """,
+            order_id,
+            courier_id,
+        )
+
+    if not order:
+
+        await callback.answer(
+            "Заказ недоступен.",
+            show_alert=True,
+        )
+
+        return
+
+    await callback.message.answer(
+        "📞 ТЕЛЕФОН КЛИЕНТА\n\n"
+        f"👤 {order['client_name']}\n"
+        f"📞 {order['client_phone']}\n\n"
+        "Нажмите на номер телефона в Telegram — "
+        "на iPhone откроется обычный телефонный звонок."
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data == "courier_full_queue"
+)
+async def courier_full_queue(
+    callback: CallbackQuery
+):
+
+    courier_id = await get_approved_courier_id(
+        callback.from_user.id
+    )
+
+    if not courier_id:
+
+        await callback.answer(
+            "Курьер не найден.",
+            show_alert=True,
+        )
+
+        return
+
+    async with db_pool.acquire() as conn:
+
+        await normalize_courier_queue(
+            conn,
+            courier_id,
+        )
+
+        orders = await conn.fetch(
+            """
+            SELECT
+                o.id,
+                o.queue_position,
+                o.status,
+                o.client_name,
+                o.delivery_address,
+                o.delivery_time
+
+            FROM orders o
+
+            WHERE o.courier_id = $1
+              AND (
+                    o.status = ANY($2::text[])
+                    OR o.status = 'problem'
+                  )
+
+            ORDER BY
+                CASE
+                    WHEN o.status = 'problem'
+                    THEN 1
+                    ELSE 0
+                END,
+                COALESCE(
+                    o.queue_position,
+                    2147483647
+                ),
+                o.id
+            """,
+            courier_id,
+            list(
+                QUEUE_ACTIVE_STATUSES
+            ),
+        )
+
+    if not orders:
+
+        await callback.answer(
+            "Активных заказов нет.",
+            show_alert=True,
+        )
+
+        return
+
+    text = (
+        "📋 ВСЯ ОЧЕРЕДЬ\n\n"
+        "Нажмите на нужный заказ, "
+        "чтобы посмотреть подробности.\n\n"
+    )
+
+    buttons = []
 
     for order in orders:
 
-        await send_courier_order_card(
-            message.from_user.id,
-            order["id"],
+        if order[
+            "status"
+        ] == "problem":
+
+            prefix = "⚠️"
+            position_text = (
+                "Проблема"
+            )
+
+        else:
+
+            prefix = (
+                "🟢"
+                if order[
+                    "queue_position"
+                ] == 1
+                else "⏳"
+            )
+
+            position_text = (
+                f"№{order['queue_position']}"
+            )
+
+        text += (
+            f"{prefix} {position_text} — "
+            f"заказ №{order['id']}\n"
+            f"👤 {order['client_name']}\n"
+            f"📍 {order['delivery_address']}\n"
+            f"🕐 {order['delivery_time']}\n\n"
         )
 
+        buttons.append([
+            InlineKeyboardButton(
+                text=(
+                    f"{prefix} Заказ "
+                    f"№{order['id']}"
+                ),
+                callback_data=(
+                    f"courier_queue_order:"
+                    f"{order['id']}"
+                ),
+            )
+        ])
+
+    await callback.message.answer(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        ),
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data.startswith(
+        "courier_queue_order:"
+    )
+)
+async def courier_queue_order_details(
+    callback: CallbackQuery
+):
+
+    order_id = int(
+        callback.data.split(":")[1]
+    )
+
+    courier_id = await get_approved_courier_id(
+        callback.from_user.id
+    )
+
+    if not courier_id:
+
+        await callback.answer(
+            "Курьер не найден.",
+            show_alert=True,
+        )
+
+        return
+
+    async with db_pool.acquire() as conn:
+
+        valid = await conn.fetchval(
+            """
+            SELECT EXISTS(
+                SELECT 1
+
+                FROM orders
+
+                WHERE id = $1
+                  AND courier_id = $2
+                  AND status NOT IN (
+                        'delivered',
+                        'cancelled',
+                        'postponed'
+                      )
+            )
+            """,
+            order_id,
+            courier_id,
+        )
+
+    if not valid:
+
+        await callback.answer(
+            "Заказ недоступен.",
+            show_alert=True,
+        )
+
+        return
+
+    await send_courier_order_card(
+        callback.from_user.id,
+        order_id,
+    )
+
+    await callback.answer()
 
 # =========================================================
 # ПРИНЯТЬ ЗАКАЗ
@@ -6048,133 +8022,400 @@ async def accept_order(
         order_id=order_id,
     )
 
-    await notify_store_users(
-        order["store_id"],
 
-        f"✅ Заказ №{order_id}\n"
-        "Курьер принял заказ."
-    )
-
-    text = await build_status_report(
-        order_id,
-        "✅ КУРЬЕР ПРИНЯЛ ЗАКАЗ",
-    )
-
-    await send_store_topic_text(
-        order["store_id"],
-        "status",
-        text,
+    await update_store_status_message(
+        order_id
     )
 
     await callback.answer()
 
 
+
 # =========================================================
-# ФОТО / ВИДЕО ПОЛУЧЕНИЯ
+# ФОТО ПОЛУЧЕНИЯ
 # =========================================================
 
-@dp.callback_query(F.data.startswith("pickup_photo:"))
-async def pickup_photo_request(callback: CallbackQuery, state: FSMContext):
-    order_id = int(callback.data.split(":")[1])
-    courier_id = await get_approved_courier_id(callback.from_user.id)
+
+@dp.callback_query(
+    F.data.startswith(
+        "pickup_photo:"
+    )
+)
+async def pickup_photo_request(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    order_id = int(
+        callback.data.split(":")[1]
+    )
+
+    courier_id = await get_approved_courier_id(
+        callback.from_user.id
+    )
+
     if not courier_id:
-        await callback.answer("Курьер не найден.", show_alert=True)
+
+        await callback.answer(
+            "Курьер не найден.",
+            show_alert=True,
+        )
+
         return
 
     async with db_pool.acquire() as conn:
+
         valid = await conn.fetchval(
-            """SELECT EXISTS(SELECT 1 FROM orders
-               WHERE id=$1 AND courier_id=$2 AND status='accepted')""",
-            order_id, courier_id,
+            """
+            SELECT EXISTS(
+                SELECT 1
+
+                FROM orders
+
+                WHERE id = $1
+                  AND courier_id = $2
+                  AND status = 'accepted'
+            )
+            """,
+            order_id,
+            courier_id,
         )
+
     if not valid:
-        await callback.answer("Заказ недоступен.", show_alert=True)
+
+        await callback.answer(
+            "Заказ недоступен.",
+            show_alert=True,
+        )
+
         return
 
-    await state.set_state(CourierPhoto.pickup_photo)
     await state.update_data(
         order_id=order_id,
         report_count=0,
-        courier_card_chat_id=callback.message.chat.id,
-        courier_card_message_id=callback.message.message_id,
+        courier_card_chat_id=(
+            callback.message.chat.id
+        ),
+        courier_card_message_id=(
+            callback.message.message_id
+        ),
     )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Готово", callback_data=f"pickup_report_done:{order_id}")
-    ]])
+
+    await state.set_state(
+        CourierPhoto.pickup_photo
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Готово",
+                    callback_data=(
+                        f"pickup_report_done:"
+                        f"{order_id}"
+                    ),
+                )
+            ]
+        ]
+    )
+
     await callback.message.answer(
-        f"📸🎥 Отправьте фото и/или видео товара для заказа №{order_id}.\n\n"
-        "Можно отправить несколько файлов подряд. Когда закончите — нажмите «✅ Готово».",
+        f"📸🎥 ОТЧЁТ ПРИ ПОЛУЧЕНИИ\n\n"
+        f"Заказ №{order_id}\n\n"
+        "Отправьте фото и/или видео.\n"
+        "Можно отправить несколько файлов подряд.\n\n"
+        "Когда закончите — нажмите "
+        "«✅ Готово».",
         reply_markup=keyboard,
     )
+
     await callback.answer()
 
 
-@dp.message(CourierPhoto.pickup_photo, F.photo | F.video)
-async def pickup_photo_received(message: Message, state: FSMContext):
+
+
+@dp.message(
+    CourierPhoto.pickup_photo,
+    F.photo | F.video,
+)
+async def pickup_photo_received(
+    message: Message,
+    state: FSMContext,
+):
+
     data = await state.get_data()
-    order_id = data["order_id"]
-    courier_id = await get_approved_courier_id(message.from_user.id)
+
+    order_id = data[
+        "order_id"
+    ]
+
+    courier_id = await get_approved_courier_id(
+        message.from_user.id
+    )
+
     if not courier_id:
-        await state.clear(); return
 
-    media_type = "photo" if message.photo else "video"
-    file_id = message.photo[-1].file_id if message.photo else message.video.file_id
-    async with db_pool.acquire() as conn:
-        order = await conn.fetchrow(
-            """SELECT id, store_id FROM orders
-               WHERE id=$1 AND courier_id=$2 AND status='accepted'""",
-            order_id, courier_id,
-        )
-        if not order:
-            await state.clear(); await message.answer("❌ Заказ недоступен."); return
-        await conn.execute(
-            """INSERT INTO order_photos(order_id,courier_id,photo_type,file_id,media_type)
-               VALUES($1,$2,'pickup',$3,$4)""",
-            order_id, courier_id, file_id, media_type,
+        await state.clear()
+
+        return
+
+    if message.photo:
+
+        media_type = "photo"
+
+        file_id = (
+            message.photo[-1].file_id
         )
 
-    count = int(data.get("report_count", 0)) + 1
-    await state.update_data(report_count=count)
-    caption = f"📦 Заказ №{order_id}\nОтчёт при получении • файл {count}"
-    if media_type == "photo":
-        await send_store_topic_photo(order["store_id"], file_id, caption)
     else:
-        await send_store_topic_video(order["store_id"], file_id, caption)
-    await message.answer(f"✅ Добавлено файлов: {count}\nМожно отправить ещё или нажать «✅ Готово».")
 
+        media_type = "video"
 
-@dp.callback_query(F.data.startswith("pickup_report_done:"))
-async def pickup_report_done(callback: CallbackQuery, state: FSMContext):
-    order_id = int(callback.data.split(":")[1])
-    data = await state.get_data()
-    if data.get("order_id") != order_id or int(data.get("report_count", 0)) < 1:
-        await callback.answer("Сначала отправьте хотя бы одно фото или видео.", show_alert=True); return
-    courier_id = await get_approved_courier_id(callback.from_user.id)
+        file_id = (
+            message.video.file_id
+        )
+
     async with db_pool.acquire() as conn:
-        async with conn.transaction():
-            order = await conn.fetchrow(
-                """UPDATE orders SET status='pickup_photo', updated_at=NOW()
-                   WHERE id=$1 AND courier_id=$2 AND status='accepted'
-                   RETURNING id, store_id""", order_id, courier_id,
+
+        order = await conn.fetchrow(
+            """
+            SELECT
+                id,
+                store_id
+
+            FROM orders
+
+            WHERE id = $1
+              AND courier_id = $2
+              AND status = 'accepted'
+            """,
+            order_id,
+            courier_id,
+        )
+
+        if not order:
+
+            await state.clear()
+
+            await message.answer(
+                "❌ Заказ недоступен."
             )
+
+            return
+
+        await conn.execute(
+            """
+            INSERT INTO order_photos (
+                order_id,
+                courier_id,
+                photo_type,
+                file_id,
+                media_type
+            )
+
+            VALUES (
+                $1,$2,'pickup',$3,$4
+            )
+            """,
+            order_id,
+            courier_id,
+            file_id,
+            media_type,
+        )
+
+    count = (
+        int(
+            data.get(
+                "report_count",
+                0,
+            )
+        )
+        + 1
+    )
+
+    await state.update_data(
+        report_count=count
+    )
+
+    caption = (
+        f"📦 Заказ №{order_id}\n"
+        f"Отчёт при получении — "
+        f"файл {count}"
+    )
+
+    if media_type == "photo":
+
+        await send_store_topic_photo(
+            order["store_id"],
+            file_id,
+            caption,
+        )
+
+    else:
+
+        await send_store_topic_video(
+            order["store_id"],
+            file_id,
+            caption,
+        )
+
+    await message.answer(
+        f"✅ Добавлено файлов: "
+        f"{count}\n\n"
+        "Можно отправить ещё фото/видео "
+        "или нажать «✅ Готово»."
+    )
+
+
+
+
+
+@dp.callback_query(
+    F.data.startswith(
+        "pickup_report_done:"
+    )
+)
+async def pickup_report_done(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    order_id = int(
+        callback.data.split(":")[1]
+    )
+
+    data = await state.get_data()
+
+    if (
+        data.get("order_id")
+        != order_id
+    ):
+
+        await callback.answer(
+            "Этот отчёт уже неактивен.",
+            show_alert=True,
+        )
+
+        return
+
+    report_count = int(
+        data.get(
+            "report_count",
+            0,
+        )
+    )
+
+    if report_count < 1:
+
+        await callback.answer(
+            "Сначала отправьте хотя бы "
+            "одно фото или видео.",
+            show_alert=True,
+        )
+
+        return
+
+    courier_id = await get_approved_courier_id(
+        callback.from_user.id
+    )
+
+    if not courier_id:
+
+        await callback.answer(
+            "Курьер не найден.",
+            show_alert=True,
+        )
+
+        return
+
+    async with db_pool.acquire() as conn:
+
+        async with conn.transaction():
+
+            order = await conn.fetchrow(
+                """
+                UPDATE orders
+
+                SET
+                    status = 'pickup_photo',
+                    updated_at = NOW()
+
+                WHERE id = $1
+                  AND courier_id = $2
+                  AND status = 'accepted'
+
+                RETURNING
+                    id,
+                    store_id
+                """,
+                order_id,
+                courier_id,
+            )
+
             if order:
-                await add_history(conn, order_id, "pickup_photo", "courier", callback.from_user.id,
-                                  f"Отчёт при получении: {data.get('report_count', 0)} фото/видео")
+
+                await add_history(
+                    conn,
+                    order_id,
+                    "pickup_photo",
+                    "courier",
+                    callback.from_user.id,
+                    (
+                        "Отчёт при получении: "
+                        f"{report_count} "
+                        "фото/видео"
+                    ),
+                )
+
     if not order:
-        await callback.answer("Заказ недоступен.", show_alert=True); return
+
+        await callback.answer(
+            "Заказ недоступен.",
+            show_alert=True,
+        )
+
+        return
+
     await state.clear()
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(f"✅ Отчёт заказа №{order_id} сохранён.")
-    await send_courier_order_card(callback.from_user.id, order_id)
-    await notify_store_users(order["store_id"], f"📸🎥 Заказ №{order_id}\nКурьер завершил отчёт при получении.")
-    await send_store_topic_text(order["store_id"], "status",
-        await build_status_report(order_id, "📸🎥 ОТЧЁТ — ПОЛУЧЕНИЕ ТОВАРА"))
-    await callback.answer("Отчёт сохранён.")
+
+    await callback.message.edit_reply_markup(
+        reply_markup=None
+    )
+
+    await callback.message.answer(
+        f"✅ Отчёт заказа №"
+        f"{order_id} сохранён."
+    )
+
+    await send_courier_order_card(
+        callback.from_user.id,
+        order_id,
+    )
 
 
-@dp.message(CourierPhoto.pickup_photo)
-async def pickup_photo_wrong(message: Message):
-    await message.answer("📸🎥 Отправьте фотографию или видео, либо нажмите «✅ Готово».")
+    await update_store_status_message(
+        order_id
+    )
+
+    await callback.answer(
+        "Отчёт сохранён."
+    )
+
+
+@dp.message(
+    CourierPhoto.pickup_photo
+)
+async def pickup_photo_wrong(
+    message: Message
+):
+
+    await message.answer(
+        "📸🎥 Отправьте фотографию "
+        "или видео.\n\n"
+        "Когда закончите — нажмите "
+        "«✅ Готово»."
+    )
+
 
 
 # =========================================================
@@ -6255,25 +8496,13 @@ async def picked_up(
         "📦 Товар забран."
     )
 
-    await notify_store_users(
-        order["store_id"],
 
-        f"📦 Заказ №{order_id}\n"
-        "Товар забран курьером."
-    )
-
-    text = await build_status_report(
-        order_id,
-        "📦 ТОВАР ЗАБРАН",
-    )
-
-    await send_store_topic_text(
-        order["store_id"],
-        "status",
-        text,
+    await update_store_status_message(
+        order_id
     )
 
     await callback.answer()
+
 
 
 # =========================================================
@@ -6353,222 +8582,852 @@ async def on_way(
         "🚗 Вы выехали к клиенту."
     )
 
-    await notify_store_users(
-        order["store_id"],
 
-        f"🚗 Заказ №{order_id}\n"
-        "Курьер выехал к клиенту."
-    )
-
-    text = await build_status_report(
-        order_id,
-        "🚗 КУРЬЕР ВЫЕХАЛ К КЛИЕНТУ",
-    )
-
-    await send_store_topic_text(
-        order["store_id"],
-        "status",
-        text,
+    await update_store_status_message(
+        order_id
     )
 
     await callback.answer()
+
 
 
 # =========================================================
 # ПРИЕХАЛ
 # =========================================================
 
-@dp.callback_query(F.data.startswith("arrived:"))
-async def arrived(callback: CallbackQuery):
-    order_id = int(callback.data.split(":")[1])
-    courier_id = await get_approved_courier_id(callback.from_user.id)
+
+@dp.callback_query(
+    F.data.startswith(
+        "arrived:"
+    )
+)
+async def arrived(
+    callback: CallbackQuery
+):
+
+    order_id = int(
+        callback.data.split(":")[1]
+    )
+
+    courier_id = await get_approved_courier_id(
+        callback.from_user.id
+    )
+
     if not courier_id:
         return
 
     async with db_pool.acquire() as conn:
+
         async with conn.transaction():
+
             order = await conn.fetchrow(
-                """UPDATE orders SET status='arrived', updated_at=NOW()
-                   WHERE id=$1 AND courier_id=$2 AND status='on_the_way'
-                   RETURNING id, store_id, created_by_telegram_id, kaspi_order_number""",
-                order_id, courier_id,
+                """
+                UPDATE orders
+
+                SET
+                    status = 'arrived',
+                    updated_at = NOW()
+
+                WHERE id = $1
+                  AND courier_id = $2
+                  AND status = 'on_the_way'
+
+                RETURNING
+                    id,
+                    store_id,
+                    created_by_telegram_id,
+                    kaspi_order_number
+                """,
+                order_id,
+                courier_id,
             )
+
             if order:
-                await add_history(conn, order_id, "arrived", "courier", callback.from_user.id,
-                                  "Курьер прибыл к клиенту")
+
+                await add_history(
+                    conn,
+                    order_id,
+                    "arrived",
+                    "courier",
+                    callback.from_user.id,
+                    "Курьер прибыл к клиенту",
+                )
+
     if not order:
-        await callback.answer("Статус недоступен.", show_alert=True); return
 
-    await update_courier_order_card(callback.message.chat.id, callback.message.message_id, order_id)
-    await notify_store_users(order["store_id"], f"📍 Заказ №{order_id}\nКурьер прибыл к клиенту.")
+        await callback.answer(
+            "Статус недоступен.",
+            show_alert=True,
+        )
 
-    kaspi_number = (order["kaspi_order_number"] or "").strip()
-    if kaspi_number and order["created_by_telegram_id"]:
+        return
+
+    await update_courier_order_card(
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
+        order_id=order_id,
+    )
+
+
+    kaspi_number = (
+        order["kaspi_order_number"]
+        or ""
+    ).strip()
+
+    if (
+        kaspi_number
+        and order[
+            "created_by_telegram_id"
+        ]
+    ):
+
         try:
-            await bot.send_message(
-                order["created_by_telegram_id"],
-                "🚨🚨🚨 КУРЬЕР ПРИЕХАЛ К КЛИЕНТУ 🚨🚨🚨\n\n"
-                f"📦 Заказ №{order_id}\n🛒 Kaspi №: {kaspi_number}\n\n"
-                "🔐 ОТПРАВЬТЕ КУРЬЕРУ КОД ПОДТВЕРЖДЕНИЯ KASPI.",
-            )
-        except Exception as error:
-            print("CREATOR ARRIVAL NOTIFY ERROR:", order_id, error)
 
-    await send_store_topic_text(order["store_id"], "status",
-        await build_status_report(order_id, "📍 КУРЬЕР ПРИБЫЛ К КЛИЕНТУ"))
-    await callback.answer("📍 Вы прибыли к клиенту.")
+            await bot.send_message(
+                order[
+                    "created_by_telegram_id"
+                ],
+                "🚨🚨🚨 "
+                "КУРЬЕР ПРИЕХАЛ К КЛИЕНТУ "
+                "🚨🚨🚨\n\n"
+                f"📦 Заказ №{order_id}\n"
+                f"🛒 Kaspi №: "
+                f"{kaspi_number}\n\n"
+                "🔐 ОТПРАВЬТЕ КУРЬЕРУ "
+                "КОД ПОДТВЕРЖДЕНИЯ KASPI."
+            )
+
+        except Exception as error:
+
+            print(
+                "CREATOR ARRIVAL NOTIFY ERROR:",
+                order_id,
+                error,
+            )
+
+    await update_store_status_message(
+        order_id
+    )
+
+    await callback.answer(
+        "📍 Вы прибыли к клиенту."
+    )
+
+
 
 
 # =========================================================
 # КОД ПОДТВЕРЖДЕНИЯ KASPI
 # =========================================================
 
-@dp.callback_query(F.data.startswith("kaspi_code:"))
-async def kaspi_code_request(callback: CallbackQuery, state: FSMContext):
-    order_id = int(callback.data.split(":")[1])
-    courier_id = await get_approved_courier_id(callback.from_user.id)
-    async with db_pool.acquire() as conn:
-        order = await conn.fetchrow(
-            """SELECT id, kaspi_order_number FROM orders
-               WHERE id=$1 AND courier_id=$2 AND status='arrived'""", order_id, courier_id,
-        )
-    if not order or not (order["kaspi_order_number"] or "").strip():
-        await callback.answer("Код Kaspi для этого заказа не требуется.", show_alert=True); return
-    await state.set_state(CourierPhoto.kaspi_code)
-    await state.update_data(order_id=order_id, courier_card_chat_id=callback.message.chat.id,
-                            courier_card_message_id=callback.message.message_id)
-    await callback.message.answer(
-        f"🔐 КОД ПОДТВЕРЖДЕНИЯ KASPI\n\n📦 Заказ №{order_id}\n"
-        f"🛒 Kaspi №: {order['kaspi_order_number']}\n\nВведите код подтверждения клиента:"
+
+@dp.callback_query(
+    F.data.startswith(
+        "kaspi_code:"
     )
+)
+async def kaspi_code_request(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    order_id = int(
+        callback.data.split(":")[1]
+    )
+
+    courier_id = await get_approved_courier_id(
+        callback.from_user.id
+    )
+
+    if not courier_id:
+
+        await callback.answer(
+            "Курьер не найден.",
+            show_alert=True,
+        )
+
+        return
+
+    async with db_pool.acquire() as conn:
+
+        order = await conn.fetchrow(
+            """
+            SELECT
+                id,
+                kaspi_order_number
+
+            FROM orders
+
+            WHERE id = $1
+              AND courier_id = $2
+              AND status = 'arrived'
+            """,
+            order_id,
+            courier_id,
+        )
+
+    if not order:
+
+        await callback.answer(
+            "Заказ недоступен.",
+            show_alert=True,
+        )
+
+        return
+
+    kaspi_number = (
+        order["kaspi_order_number"]
+        or ""
+    ).strip()
+
+    if not kaspi_number:
+
+        await callback.answer(
+            "Код Kaspi для этого "
+            "заказа не требуется.",
+            show_alert=True,
+        )
+
+        return
+
+    await state.update_data(
+        order_id=order_id,
+        courier_card_chat_id=(
+            callback.message.chat.id
+        ),
+        courier_card_message_id=(
+            callback.message.message_id
+        ),
+    )
+
+    await state.set_state(
+        CourierPhoto.kaspi_code
+    )
+
+    await callback.message.answer(
+        "🔐 КОД ПОДТВЕРЖДЕНИЯ KASPI\n\n"
+        f"📦 Заказ №{order_id}\n"
+        f"🛒 Kaspi №: "
+        f"{kaspi_number}\n\n"
+        "Введите код подтверждения клиента:"
+    )
+
     await callback.answer()
 
 
-@dp.message(CourierPhoto.kaspi_code)
-async def kaspi_code_received(message: Message, state: FSMContext):
-    code = (message.text or "").strip()
+@dp.message(
+    CourierPhoto.kaspi_code
+)
+async def kaspi_code_received(
+    message: Message,
+    state: FSMContext,
+):
+
+    code = (
+        message.text
+        or ""
+    ).strip()
+
     if not code:
-        await message.answer("❌ Введите код подтверждения текстом."); return
-    data = await state.get_data(); order_id = data["order_id"]
-    courier_id = await get_approved_courier_id(message.from_user.id)
+
+        await message.answer(
+            "❌ Введите код "
+            "подтверждения текстом."
+        )
+
+        return
+
+    data = await state.get_data()
+
+    order_id = data[
+        "order_id"
+    ]
+
+    courier_id = await get_approved_courier_id(
+        message.from_user.id
+    )
+
+    if not courier_id:
+
+        await state.clear()
+
+        return
+
     async with db_pool.acquire() as conn:
+
         async with conn.transaction():
+
             order = await conn.fetchrow(
-                """UPDATE orders SET kaspi_confirmation_code=$1, status='kaspi_code', updated_at=NOW()
-                   WHERE id=$2 AND courier_id=$3 AND status='arrived'
-                   AND COALESCE(TRIM(kaspi_order_number),'') <> ''
-                   RETURNING id, store_id, created_by_telegram_id, kaspi_order_number""",
-                code, order_id, courier_id,
+                """
+                UPDATE orders
+
+                SET
+                    kaspi_confirmation_code = $1,
+                    status = 'kaspi_code',
+                    updated_at = NOW()
+
+                WHERE id = $2
+                  AND courier_id = $3
+                  AND status = 'arrived'
+                  AND COALESCE(
+                        TRIM(
+                            kaspi_order_number
+                        ),
+                        ''
+                      ) <> ''
+
+                RETURNING
+                    id,
+                    store_id,
+                    created_by_telegram_id,
+                    kaspi_order_number
+                """,
+                code,
+                order_id,
+                courier_id,
             )
+
             if order:
-                courier_name = await conn.fetchval("SELECT full_name FROM couriers WHERE id=$1", courier_id)
-                await add_history(conn, order_id, "kaspi_code", "courier", message.from_user.id,
-                                  "Курьер ввёл код подтверждения Kaspi")
+
+                courier_name = await conn.fetchval(
+                    """
+                    SELECT full_name
+
+                    FROM couriers
+
+                    WHERE id = $1
+                    """,
+                    courier_id,
+                )
+
+                await add_history(
+                    conn,
+                    order_id,
+                    "kaspi_code",
+                    "courier",
+                    message.from_user.id,
+                    (
+                        "Курьер ввёл код "
+                        "подтверждения Kaspi"
+                    ),
+                )
+
     if not order:
-        await state.clear(); await message.answer("❌ Заказ недоступен."); return
+
+        await state.clear()
+
+        await message.answer(
+            "❌ Заказ недоступен."
+        )
+
+        return
 
     await state.clear()
-    await message.answer(f"✅ Код Kaspi для заказа №{order_id} сохранён.")
-    await send_courier_order_card(message.from_user.id, order_id)
+
+    await message.answer(
+        f"✅ Код Kaspi для заказа "
+        f"№{order_id} сохранён."
+    )
+
+    await send_courier_order_card(
+        message.from_user.id,
+        order_id,
+    )
+
     notice = (
         "🚨 KASPI — КОД ПОДТВЕРЖДЕНИЯ 🚨\n\n"
-        f"📦 Заказ №{order_id}\n🛒 Kaspi №: {order['kaspi_order_number']}\n"
-        f"🚚 Курьер: {courier_name or '-'}\n\n🔐 КОД: {code}\n\n✅ Код получен курьером."
+        f"📦 Заказ №{order_id}\n"
+        f"🛒 Kaspi №: "
+        f"{order['kaspi_order_number']}\n"
+        f"🚚 Курьер: "
+        f"{courier_name or '-'}\n\n"
+        f"🔐 КОД: {code}\n\n"
+        "✅ Код получен курьером."
     )
-    if order["created_by_telegram_id"]:
+
+    creator_id = order[
+        "created_by_telegram_id"
+    ]
+
+    if creator_id:
+
         try:
-            await bot.send_message(order["created_by_telegram_id"], notice)
+
+            await bot.send_message(
+                creator_id,
+                notice,
+            )
+
         except Exception as error:
-            print("CREATOR KASPI CODE NOTIFY ERROR:", order_id, error)
-    await send_store_topic_text(order["store_id"], "status", notice)
+
+            print(
+                "CREATOR KASPI CODE "
+                "NOTIFY ERROR:",
+                order_id,
+                error,
+            )
+
+    await update_store_status_message(
+        order_id
+    )
 
 
 # =========================================================
 # ФОТО / ВИДЕО ДОСТАВКИ
 # =========================================================
 
-@dp.callback_query(F.data.startswith("delivery_photo:"))
-async def delivery_photo_request(callback: CallbackQuery, state: FSMContext):
-    order_id = int(callback.data.split(":")[1])
-    courier_id = await get_approved_courier_id(callback.from_user.id)
+
+@dp.callback_query(
+    F.data.startswith(
+        "delivery_photo:"
+    )
+)
+async def delivery_photo_request(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    order_id = int(
+        callback.data.split(":")[1]
+    )
+
+    courier_id = await get_approved_courier_id(
+        callback.from_user.id
+    )
+
     if not courier_id:
-        await callback.answer("Курьер не найден.", show_alert=True); return
-    async with db_pool.acquire() as conn:
-        order = await conn.fetchrow(
-            """SELECT id, kaspi_order_number FROM orders WHERE id=$1 AND courier_id=$2
-               AND status IN ('arrived','kaspi_code')""", order_id, courier_id,
+
+        await callback.answer(
+            "Курьер не найден.",
+            show_alert=True,
         )
+
+        return
+
+    async with db_pool.acquire() as conn:
+
+        order = await conn.fetchrow(
+            """
+            SELECT
+                id,
+                kaspi_order_number,
+                kaspi_confirmation_code,
+                status
+
+            FROM orders
+
+            WHERE id = $1
+              AND courier_id = $2
+              AND status IN (
+                    'arrived',
+                    'kaspi_code'
+                  )
+            """,
+            order_id,
+            courier_id,
+        )
+
     if not order:
-        await callback.answer("Заказ недоступен.", show_alert=True); return
-    if (order["kaspi_order_number"] or "").strip() and False:  # safeguard kept explicit
-        pass
-    await state.set_state(CourierPhoto.delivery_photo)
-    await state.update_data(order_id=order_id, report_count=0,
-        courier_card_chat_id=callback.message.chat.id, courier_card_message_id=callback.message.message_id)
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Готово", callback_data=f"delivery_report_done:{order_id}")
-    ]])
+
+        await callback.answer(
+            "Заказ недоступен.",
+            show_alert=True,
+        )
+
+        return
+
+    has_kaspi = bool(
+        (
+            order[
+                "kaspi_order_number"
+            ]
+            or ""
+        ).strip()
+    )
+
+    if (
+        has_kaspi
+        and order["status"]
+        != "kaspi_code"
+    ):
+
+        await callback.answer(
+            "Для Kaspi-заказа сначала "
+            "введите код подтверждения.",
+            show_alert=True,
+        )
+
+        return
+
+    await state.update_data(
+        order_id=order_id,
+        report_count=0,
+        courier_card_chat_id=(
+            callback.message.chat.id
+        ),
+        courier_card_message_id=(
+            callback.message.message_id
+        ),
+    )
+
+    await state.set_state(
+        CourierPhoto.delivery_photo
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Готово",
+                    callback_data=(
+                        f"delivery_report_done:"
+                        f"{order_id}"
+                    ),
+                )
+            ]
+        ]
+    )
+
     await callback.message.answer(
-        f"📸🎥 Отправьте фото и/или видео доставки заказа №{order_id}.\n\n"
-        "Можно отправить несколько файлов подряд. Когда закончите — нажмите «✅ Готово».",
+        f"📸🎥 ОТЧЁТ ДОСТАВКИ\n\n"
+        f"Заказ №{order_id}\n\n"
+        "Отправьте фото и/или видео.\n"
+        "Можно отправить несколько файлов подряд.\n\n"
+        "Когда закончите — нажмите "
+        "«✅ Готово».",
         reply_markup=keyboard,
     )
+
     await callback.answer()
 
 
-@dp.message(CourierPhoto.delivery_photo, F.photo | F.video)
-async def delivery_photo_received(message: Message, state: FSMContext):
-    data=await state.get_data(); order_id=data["order_id"]
-    courier_id=await get_approved_courier_id(message.from_user.id)
+
+
+@dp.message(
+    CourierPhoto.delivery_photo,
+    F.photo | F.video,
+)
+async def delivery_photo_received(
+    message: Message,
+    state: FSMContext,
+):
+
+    data = await state.get_data()
+
+    order_id = data[
+        "order_id"
+    ]
+
+    courier_id = await get_approved_courier_id(
+        message.from_user.id
+    )
+
     if not courier_id:
-        await state.clear(); return
-    media_type="photo" if message.photo else "video"
-    file_id=message.photo[-1].file_id if message.photo else message.video.file_id
+
+        await state.clear()
+
+        return
+
+    if message.photo:
+
+        media_type = "photo"
+
+        file_id = (
+            message.photo[-1].file_id
+        )
+
+    else:
+
+        media_type = "video"
+
+        file_id = (
+            message.video.file_id
+        )
+
     async with db_pool.acquire() as conn:
-        order=await conn.fetchrow(
-            """SELECT id,store_id FROM orders WHERE id=$1 AND courier_id=$2
-               AND status IN ('arrived','kaspi_code')""", order_id,courier_id)
+
+        order = await conn.fetchrow(
+            """
+            SELECT
+                id,
+                store_id,
+                kaspi_order_number,
+                status
+
+            FROM orders
+
+            WHERE id = $1
+              AND courier_id = $2
+              AND status IN (
+                    'arrived',
+                    'kaspi_code'
+                  )
+            """,
+            order_id,
+            courier_id,
+        )
+
         if not order:
-            await state.clear(); await message.answer("❌ Заказ недоступен."); return
+
+            await state.clear()
+
+            await message.answer(
+                "❌ Заказ недоступен."
+            )
+
+            return
+
+        has_kaspi = bool(
+            (
+                order[
+                    "kaspi_order_number"
+                ]
+                or ""
+            ).strip()
+        )
+
+        if (
+            has_kaspi
+            and order["status"]
+            != "kaspi_code"
+        ):
+
+            await state.clear()
+
+            await message.answer(
+                "❌ Для Kaspi-заказа "
+                "сначала введите код "
+                "подтверждения."
+            )
+
+            return
+
         await conn.execute(
-            """INSERT INTO order_photos(order_id,courier_id,photo_type,file_id,media_type)
-               VALUES($1,$2,'delivery',$3,$4)""", order_id,courier_id,file_id,media_type)
-    count=int(data.get("report_count",0))+1; await state.update_data(report_count=count)
-    caption=f"✅ Заказ №{order_id}\nОтчёт доставки • файл {count}"
-    if media_type=="photo": await send_store_topic_photo(order["store_id"],file_id,caption)
-    else: await send_store_topic_video(order["store_id"],file_id,caption)
-    await message.answer(f"✅ Добавлено файлов: {count}\nМожно отправить ещё или нажать «✅ Готово».")
+            """
+            INSERT INTO order_photos (
+                order_id,
+                courier_id,
+                photo_type,
+                file_id,
+                media_type
+            )
+
+            VALUES (
+                $1,$2,'delivery',$3,$4
+            )
+            """,
+            order_id,
+            courier_id,
+            file_id,
+            media_type,
+        )
+
+    count = (
+        int(
+            data.get(
+                "report_count",
+                0,
+            )
+        )
+        + 1
+    )
+
+    await state.update_data(
+        report_count=count
+    )
+
+    caption = (
+        f"✅ Заказ №{order_id}\n"
+        f"Отчёт доставки — "
+        f"файл {count}"
+    )
+
+    if media_type == "photo":
+
+        await send_store_topic_photo(
+            order["store_id"],
+            file_id,
+            caption,
+        )
+
+    else:
+
+        await send_store_topic_video(
+            order["store_id"],
+            file_id,
+            caption,
+        )
+
+    await message.answer(
+        f"✅ Добавлено файлов: "
+        f"{count}\n\n"
+        "Можно отправить ещё фото/видео "
+        "или нажать «✅ Готово»."
+    )
 
 
-@dp.callback_query(F.data.startswith("delivery_report_done:"))
-async def delivery_report_done(callback: CallbackQuery, state: FSMContext):
-    order_id=int(callback.data.split(":")[1]); data=await state.get_data()
-    if data.get("order_id") != order_id or int(data.get("report_count",0)) < 1:
-        await callback.answer("Сначала отправьте хотя бы одно фото или видео.",show_alert=True); return
-    courier_id=await get_approved_courier_id(callback.from_user.id)
+
+
+
+@dp.callback_query(
+    F.data.startswith(
+        "delivery_report_done:"
+    )
+)
+async def delivery_report_done(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    order_id = int(
+        callback.data.split(":")[1]
+    )
+
+    data = await state.get_data()
+
+    if (
+        data.get("order_id")
+        != order_id
+    ):
+
+        await callback.answer(
+            "Этот отчёт уже неактивен.",
+            show_alert=True,
+        )
+
+        return
+
+    report_count = int(
+        data.get(
+            "report_count",
+            0,
+        )
+    )
+
+    if report_count < 1:
+
+        await callback.answer(
+            "Сначала отправьте хотя бы "
+            "одно фото или видео.",
+            show_alert=True,
+        )
+
+        return
+
+    courier_id = await get_approved_courier_id(
+        callback.from_user.id
+    )
+
+    if not courier_id:
+
+        await callback.answer(
+            "Курьер не найден.",
+            show_alert=True,
+        )
+
+        return
+
     async with db_pool.acquire() as conn:
+
         async with conn.transaction():
-            order=await conn.fetchrow(
-                """UPDATE orders SET status='delivery_photo',updated_at=NOW()
-                   WHERE id=$1 AND courier_id=$2 AND status IN ('arrived','kaspi_code')
-                   AND (COALESCE(TRIM(kaspi_order_number),'')='' OR status='kaspi_code')
-                   RETURNING id,store_id""",order_id,courier_id)
-            if order: await add_history(conn,order_id,"delivery_photo","courier",callback.from_user.id,
-                f"Отчёт доставки: {data.get('report_count',0)} фото/видео")
+
+            order = await conn.fetchrow(
+                """
+                UPDATE orders
+
+                SET
+                    status = 'delivery_photo',
+                    updated_at = NOW()
+
+                WHERE id = $1
+                  AND courier_id = $2
+                  AND status IN (
+                        'arrived',
+                        'kaspi_code'
+                      )
+                  AND (
+                        COALESCE(
+                            TRIM(
+                                kaspi_order_number
+                            ),
+                            ''
+                        ) = ''
+                        OR status = 'kaspi_code'
+                      )
+
+                RETURNING
+                    id,
+                    store_id
+                """,
+                order_id,
+                courier_id,
+            )
+
+            if order:
+
+                await add_history(
+                    conn,
+                    order_id,
+                    "delivery_photo",
+                    "courier",
+                    callback.from_user.id,
+                    (
+                        "Отчёт доставки: "
+                        f"{report_count} "
+                        "фото/видео"
+                    ),
+                )
+
     if not order:
-        await callback.answer("Для Kaspi-заказа сначала введите код подтверждения.",show_alert=True); return
-    await state.clear(); await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(f"✅ Отчёт доставки заказа №{order_id} сохранён.")
-    await send_courier_order_card(callback.from_user.id,order_id)
-    await notify_store_users(order["store_id"],f"📸🎥 Заказ №{order_id}\nКурьер завершил отчёт доставки.")
-    await send_store_topic_text(order["store_id"],"status",
-        await build_status_report(order_id,"📸🎥 ОТЧЁТ — ДОСТАВКА"))
-    await callback.answer("Отчёт сохранён.")
+
+        await callback.answer(
+            "Для Kaspi-заказа сначала "
+            "введите код подтверждения.",
+            show_alert=True,
+        )
+
+        return
+
+    await state.clear()
+
+    await callback.message.edit_reply_markup(
+        reply_markup=None
+    )
+
+    await callback.message.answer(
+        f"✅ Отчёт доставки заказа "
+        f"№{order_id} сохранён."
+    )
+
+    await send_courier_order_card(
+        callback.from_user.id,
+        order_id,
+    )
 
 
-@dp.message(CourierPhoto.delivery_photo)
-async def delivery_photo_wrong(message: Message):
-    await message.answer("📸🎥 Отправьте фотографию или видео, либо нажмите «✅ Готово».")
+    await update_store_status_message(
+        order_id
+    )
+
+    await callback.answer(
+        "Отчёт сохранён."
+    )
+
+
+@dp.message(
+    CourierPhoto.delivery_photo
+)
+async def delivery_photo_wrong(
+    message: Message
+):
+
+    await message.answer(
+        "📸🎥 Отправьте фотографию "
+        "или видео.\n\n"
+        "Когда закончите — нажмите "
+        "«✅ Готово»."
+    )
+
 
 
 # =========================================================
@@ -6664,30 +9523,15 @@ async def delivered(
         reply_markup=courier_keyboard,
     )
 
-    await notify_store_users(
-        order["store_id"],
 
-        f"✅ Заказ №{order_id} "
-        "успешно доставлен.\n\n"
-
-        f"💰 Стоимость: "
-        f"{price_text(order['delivery_price'])}"
-    )
-
-    text = await build_status_report(
-        order_id,
-        "✅ ДОСТАВКА ЗАВЕРШЕНА",
-    )
-
-    await send_store_topic_text(
-        order["store_id"],
-        "status",
-        text,
+    await update_store_status_message(
+        order_id
     )
 
     await callback.answer(
         "Доставка завершена."
     )
+
 
 
 # =========================================================
@@ -7197,33 +10041,15 @@ async def assign_order(
         order_id,
     )
 
-    await notify_store_users(
-        order["store_id"],
 
-        f"🚚 Заказ №{order_id}\n"
-
-        f"Назначен курьер: "
-        f"{courier['full_name']}."
-    )
-
-    text = await build_status_report(
-        order_id,
-
-        (
-            f"🚚 НАЗНАЧЕН КУРЬЕР: "
-            f"{courier['full_name']}"
-        ),
-    )
-
-    await send_store_topic_text(
-        order["store_id"],
-        "status",
-        text,
+    await update_store_status_message(
+        order_id
     )
 
     await callback.answer(
         "Заказ назначен."
     )
+
 
 
 # =========================================================
@@ -7750,6 +10576,7 @@ async def admin_history(
 # АДМИН — ФОТО
 # =========================================================
 
+
 @dp.callback_query(
     F.data.startswith(
         "admin_photos:"
@@ -7789,7 +10616,7 @@ async def admin_photos(
     if not photos:
 
         await callback.answer(
-            "Фотографий нет.",
+            "Фото и видео отсутствуют.",
             show_alert=True,
         )
 
@@ -7799,37 +10626,50 @@ async def admin_photos(
 
     for photo in photos:
 
-        if photo["photo_type"] == "pickup":
+        if photo[
+            "photo_type"
+        ] == "pickup":
 
             caption = (
                 f"📦 Заказ №{order_id}\n"
-                "Фото товара при получении"
+                "Отчёт при получении"
             )
 
         else:
 
             caption = (
                 f"✅ Заказ №{order_id}\n"
-                "Фото после доставки"
+                "Отчёт после доставки"
             )
 
         try:
 
-            if photo["media_type"] == "video":
+            if (
+                photo["media_type"]
+                == "video"
+            ):
+
                 await bot.send_video(
                     callback.from_user.id,
-                    video=photo["file_id"],
+                    video=photo[
+                        "file_id"
+                    ],
                     caption=caption,
                 )
+
             else:
+
                 await bot.send_photo(
                     callback.from_user.id,
-                    photo=photo["file_id"],
+                    photo=photo[
+                        "file_id"
+                    ],
                     caption=caption,
                 )
 
         except Exception:
             pass
+
 
 
 # =========================================================
@@ -8207,20 +11047,14 @@ async def confirm_cancel_order(
             "отменён администратором."
         )
 
-    text = await build_status_report(
-        order_id,
-        "❌ ЗАКАЗ ОТМЕНЁН",
-    )
-
-    await send_store_topic_text(
-        order["store_id"],
-        "status",
-        text,
+    await update_store_status_message(
+        order_id
     )
 
     await callback.answer(
         "Заказ отменён."
     )
+
 
 
 # =========================================================
@@ -8540,33 +11374,15 @@ async def confirm_reassign(
         order_id,
     )
 
-    await notify_store_users(
-        order["store_id"],
 
-        f"🔄 Заказ №{order_id}\n"
-
-        f"Новый курьер: "
-        f"{new_courier['full_name']}"
-    )
-
-    text = await build_status_report(
-        order_id,
-
-        (
-            f"🔄 КУРЬЕР ИЗМЕНЁН: "
-            f"{new_courier['full_name']}"
-        ),
-    )
-
-    await send_store_topic_text(
-        order["store_id"],
-        "status",
-        text,
+    await update_store_status_message(
+        order_id
     )
 
     await callback.answer(
         "Курьер изменён."
     )
+
 
 
 @dp.callback_query(
@@ -9654,7 +12470,12 @@ async def register_order_problem(
         except Exception:
             pass
 
+    await update_store_status_message(
+        order_id
+    )
+
     return order
+
 
 
 @dp.callback_query(
@@ -10016,9 +12837,14 @@ async def admin_problem_continue(
         "Доставка продолжается."
     )
 
+    await update_store_status_message(
+        order_id
+    )
+
     await callback.answer(
         "Доставка продолжена."
     )
+
 
 
 # =========================================================
@@ -10524,6 +13350,7 @@ async def fallback(
 # ЗАПУСК
 # =========================================================
 
+
 async def main():
 
     print(
@@ -10551,16 +13378,34 @@ async def main():
         scheduled_orders_worker()
     )
 
+    morning_worker_task = asyncio.create_task(
+        morning_menu_worker()
+    )
+
     try:
+
         await dp.start_polling(
             bot
         )
+
     finally:
+
         scheduled_worker_task.cancel()
-        try:
-            await scheduled_worker_task
-        except asyncio.CancelledError:
-            pass
+
+        morning_worker_task.cancel()
+
+        for task in (
+            scheduled_worker_task,
+            morning_worker_task,
+        ):
+
+            try:
+
+                await task
+
+            except asyncio.CancelledError:
+                pass
+
 
 
 if __name__ == "__main__":
@@ -10568,213 +13413,3 @@ if __name__ == "__main__":
     asyncio.run(
         main()
     )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
