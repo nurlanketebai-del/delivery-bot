@@ -2373,6 +2373,36 @@ async def update_courier_order_card(
             error,
         )
 
+
+async def send_courier_order_card(
+    telegram_id: int,
+    order_id: int,
+):
+
+    text, keyboard = await get_courier_order_card(
+        order_id
+    )
+
+    if not text:
+        return
+
+    try:
+
+        await bot.send_message(
+            chat_id=telegram_id,
+            text=text,
+            reply_markup=keyboard,
+        )
+
+    except Exception as error:
+
+        print(
+            "COURIER CARD SEND ERROR:",
+            order_id,
+            error,
+        )
+
+
 # =========================================================
 # START
 # =========================================================
@@ -10720,4 +10750,3 @@ if __name__ == "__main__":
     asyncio.run(
         main()
     )
-
