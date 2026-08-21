@@ -45,6 +45,19 @@ def safe_int(value):
 
 ADMIN_ID = safe_int(ADMIN_ID_RAW)
 
+# Второй администратор.
+# Первый администратор по-прежнему берётся из ADMIN_ID в Railway.
+SECOND_ADMIN_ID = 451626217
+
+ADMIN_IDS = {
+    admin_id
+    for admin_id in (
+        ADMIN_ID,
+        SECOND_ADMIN_ID,
+    )
+    if admin_id
+}
+
 LOCAL_TZ = ZoneInfo("Asia/Almaty")
 
 
@@ -163,10 +176,7 @@ class CourierProblem(StatesGroup):
 # =========================================================
 
 def is_admin(user_id: int) -> bool:
-    return (
-        ADMIN_ID != 0
-        and user_id == ADMIN_ID
-    )
+    return user_id in ADMIN_IDS
 
 
 def main_keyboard(role, user_id: int):
@@ -1728,42 +1738,45 @@ async def release_postponed_orders():
 
 
 async def send_order_to_admin(order_id: int):
-    if not ADMIN_ID:
+    if not ADMIN_IDS:
         return
 
     order = await get_order_full(order_id)
     if not order:
         return
 
-    try:
-        await bot.send_message(
-            ADMIN_ID,
-            build_order_text(
-                order,
-                title=f"🆕 НОВЫЙ ЗАКАЗ №{order_id}",
-            ),
-        )
+    documents = await get_order_documents(order_id)
 
-        documents = await get_order_documents(order_id)
+    for admin_id in ADMIN_IDS:
 
-        for document in documents:
-            try:
-                await bot.send_document(
-                    chat_id=ADMIN_ID,
-                    document=document["file_id"],
-                    caption=(
-                        f"📎 Заказ №{order_id}\n"
-                        f"{document['file_name'] or 'Документ'}"
-                    ),
-                )
-            except Exception:
-                pass
+        try:
+            await bot.send_message(
+                admin_id,
+                build_order_text(
+                    order,
+                    title=f"🆕 НОВЫЙ ЗАКАЗ №{order_id}",
+                ),
+            )
 
-    except Exception as error:
-        print(
-            f"Could not send order #{order_id} to admin:",
-            error,
-        )
+            for document in documents:
+                try:
+                    await bot.send_document(
+                        chat_id=admin_id,
+                        document=document["file_id"],
+                        caption=(
+                            f"📎 Заказ №{order_id}\n"
+                            f"{document['file_name'] or 'Документ'}"
+                        ),
+                    )
+                except Exception:
+                    pass
+
+        except Exception as error:
+            print(
+                f"Could not send order #{order_id} "
+                f"to admin {admin_id}:",
+                error,
+            )
 
 
 async def publish_new_order(order_id: int):
@@ -2959,9 +2972,9 @@ async def get_morning_menu_users():
             "courier",
         )
 
-    if ADMIN_ID:
+    for admin_id in ADMIN_IDS:
         users.setdefault(
-            ADMIN_ID,
+            admin_id,
             None,
         )
 
@@ -12412,7 +12425,7 @@ async def register_order_problem(
         ),
     )
 
-    if ADMIN_ID:
+    if ADMIN_IDS:
 
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -12453,22 +12466,24 @@ async def register_order_problem(
             ]
         )
 
-        try:
+        for admin_id in ADMIN_IDS:
 
-            await bot.send_message(
-                ADMIN_ID,
-                f"⚠️ ПРОБЛЕМА С ЗАКАЗОМ №{order_id}\n\n"
-                f"Причина: {reason}"
-                + (
-                    f"\n📝 {details}"
-                    if details
-                    else ""
-                ),
-                reply_markup=keyboard,
-            )
+            try:
 
-        except Exception:
-            pass
+                await bot.send_message(
+                    admin_id,
+                    f"⚠️ ПРОБЛЕМА С ЗАКАЗОМ №{order_id}\n\n"
+                    f"Причина: {reason}"
+                    + (
+                        f"\n📝 {details}"
+                        if details
+                        else ""
+                    ),
+                    reply_markup=keyboard,
+                )
+
+            except Exception:
+                pass
 
     await update_store_status_message(
         order_id
@@ -13364,9 +13379,9 @@ async def main():
     )
 
     print(
-        "Admin ID:",
-        ADMIN_ID
-        if ADMIN_ID
+        "Admin IDs:",
+        sorted(ADMIN_IDS)
+        if ADMIN_IDS
         else "NOT SET",
     )
 
