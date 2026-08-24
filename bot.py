@@ -45,19 +45,6 @@ def safe_int(value):
 
 ADMIN_ID = safe_int(ADMIN_ID_RAW)
 
-# Второй администратор.
-# Первый администратор по-прежнему берётся из ADMIN_ID в Railway.
-SECOND_ADMIN_ID = 451626217
-
-ADMIN_IDS = {
-    admin_id
-    for admin_id in (
-        ADMIN_ID,
-        SECOND_ADMIN_ID,
-    )
-    if admin_id
-}
-
 LOCAL_TZ = ZoneInfo("Asia/Almaty")
 
 
@@ -155,6 +142,9 @@ class CourierPhoto(StatesGroup):
     kaspi_code = State()
 
 
+class AdminManualComplete(StatesGroup):
+    reason_text = State()
+
 class AdminSearch(StatesGroup):
     order_id = State()
 
@@ -176,7 +166,10 @@ class CourierProblem(StatesGroup):
 # =========================================================
 
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    return (
+        ADMIN_ID != 0
+        and user_id == ADMIN_ID
+    )
 
 
 def main_keyboard(role, user_id: int):
@@ -1737,46 +1730,53 @@ async def release_postponed_orders():
     return len(released)
 
 
-async def send_order_to_admin(order_id: int):
-    if not ADMIN_IDS:
+
+async def send_order_to_admin(
+    order_id: int
+):
+
+    if not ADMIN_ID:
         return
 
-    order = await get_order_full(order_id)
+    order = await get_order_full(
+        order_id
+    )
+
     if not order:
         return
 
-    documents = await get_order_documents(order_id)
+    documents = await get_order_documents(
+        order_id
+    )
 
-    for admin_id in ADMIN_IDS:
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            build_order_text(
+                order,
+                title=f"🆕 НОВЫЙ ЗАКАЗ №{order_id}",
+            ),
+        )
 
-        try:
-            await bot.send_message(
-                admin_id,
-                build_order_text(
-                    order,
-                    title=f"🆕 НОВЫЙ ЗАКАЗ №{order_id}",
-                ),
-            )
+        for document in documents:
+            try:
+                await bot.send_document(
+                    chat_id=ADMIN_ID,
+                    document=document["file_id"],
+                    caption=(
+                        f"📎 Заказ №{order_id}\n"
+                        f"{document['file_name'] or 'Документ'}"
+                    ),
+                )
+            except Exception:
+                pass
 
-            for document in documents:
-                try:
-                    await bot.send_document(
-                        chat_id=admin_id,
-                        document=document["file_id"],
-                        caption=(
-                            f"📎 Заказ №{order_id}\n"
-                            f"{document['file_name'] or 'Документ'}"
-                        ),
-                    )
-                except Exception:
-                    pass
+    except Exception as error:
+        print(
+            f"Could not send order #{order_id} to admin:",
+            error,
+        )
 
-        except Exception as error:
-            print(
-                f"Could not send order #{order_id} "
-                f"to admin {admin_id}:",
-                error,
-            )
 
 
 async def publish_new_order(order_id: int):
@@ -2972,9 +2972,9 @@ async def get_morning_menu_users():
             "courier",
         )
 
-    for admin_id in ADMIN_IDS:
+    if ADMIN_ID:
         users.setdefault(
-            admin_id,
+            ADMIN_ID,
             None,
         )
 
@@ -10185,6 +10185,15 @@ async def admin_active_orders(
                 ],
                 [
                     InlineKeyboardButton(
+                        text="✅ Завершить вручную",
+                        callback_data=(
+                            f"admin_complete:"
+                            f"{order['id']}"
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
                         text="❌ Отменить заказ",
                         callback_data=(
                             f"cancel_order_admin:"
@@ -10222,6 +10231,7 @@ async def admin_active_orders(
 
             reply_markup=keyboard,
         )
+
 
 
 # =========================================================
@@ -10480,6 +10490,16 @@ async def admin_search_order(
 
         buttons.append([
             InlineKeyboardButton(
+                text="✅ Завершить вручную",
+                callback_data=(
+                    f"admin_complete:"
+                    f"{order_id}"
+                ),
+            )
+        ])
+
+        buttons.append([
+            InlineKeyboardButton(
                 text="❌ Отменить заказ",
                 callback_data=(
                     f"cancel_order_admin:"
@@ -10497,6 +10517,7 @@ async def admin_search_order(
             inline_keyboard=buttons
         ),
     )
+
 
 
 # =========================================================
@@ -10872,6 +10893,336 @@ async def save_price(
         f"{price_text(value)}"
     )
 
+
+
+# =========================================================
+# АДМИН — РУЧНОЕ ЗАВЕРШЕНИЕ ЗАКАЗА
+# =========================================================
+
+MANUAL_COMPLETE_REASONS = {
+    "pickup": "🏪 Самовывоз",
+    "store_issue": "🤝 Выдано клиенту на месте",
+    "manual_delivery": "🚚 Доставлено вручную",
+}
+
+
+def manual_complete_reason_keyboard(order_id: int):
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🏪 Самовывоз",
+                callback_data=f"admin_complete_reason:{order_id}:pickup",
+            )],
+            [InlineKeyboardButton(
+                text="🤝 Выдано клиенту на месте",
+                callback_data=f"admin_complete_reason:{order_id}:store_issue",
+            )],
+            [InlineKeyboardButton(
+                text="🚚 Доставлено вручную",
+                callback_data=f"admin_complete_reason:{order_id}:manual_delivery",
+            )],
+            [InlineKeyboardButton(
+                text="✍️ Другая причина",
+                callback_data=f"admin_complete_other:{order_id}",
+            )],
+            [InlineKeyboardButton(
+                text="↩️ Отмена",
+                callback_data="cancel_admin_action",
+            )],
+        ]
+    )
+
+
+def manual_complete_confirm_keyboard(order_id: int, reason_key: str):
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="✅ Да, завершить",
+                callback_data=f"admin_complete_confirm:{order_id}:{reason_key}",
+            )],
+            [InlineKeyboardButton(
+                text="↩️ Назад",
+                callback_data=f"admin_complete:{order_id}",
+            )],
+        ]
+    )
+
+
+async def perform_manual_admin_complete(
+    order_id: int,
+    admin_telegram_id: int,
+    reason_text: str,
+):
+
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+
+            order = await conn.fetchrow(
+                """
+                SELECT id, store_id, courier_id, status
+                FROM orders
+                WHERE id = $1
+                FOR UPDATE
+                """,
+                order_id,
+            )
+
+            if not order:
+                return None
+
+            if order["status"] in (
+                "delivered",
+                "cancelled",
+                "postponed",
+            ):
+                return None
+
+            old_courier_id = order["courier_id"]
+
+            updated = await conn.fetchrow(
+                """
+                UPDATE orders
+                SET
+                    status = 'delivered',
+                    updated_at = NOW(),
+                    courier_id = NULL,
+                    queue_position = NULL
+                WHERE id = $1
+                RETURNING id, store_id
+                """,
+                order_id,
+            )
+
+            await add_history(
+                conn,
+                order_id,
+                "delivered",
+                "admin",
+                admin_telegram_id,
+                (
+                    "Администратор завершил заказ вручную. "
+                    f"Причина: {reason_text}"
+                ),
+            )
+
+            if old_courier_id:
+                await normalize_courier_queue(
+                    conn,
+                    old_courier_id,
+                )
+
+    await update_store_status_message(order_id)
+
+    if old_courier_id:
+        await notify_courier(
+            old_courier_id,
+            f"✅ Заказ №{order_id} закрыт администратором.\n\n"
+            f"Причина: {reason_text}"
+        )
+
+    await notify_store_users(
+        updated["store_id"],
+        f"✅ Заказ №{order_id} завершён администратором.\n\n"
+        f"Причина: {reason_text}"
+    )
+
+    return updated
+
+
+@dp.callback_query(F.data.startswith("admin_complete:"))
+async def admin_complete_start(callback: CallbackQuery):
+
+    if await deny_admin_callback(callback):
+        return
+
+    order_id = int(callback.data.split(":")[1])
+    order = await get_order_full(order_id)
+
+    if not order:
+        await callback.answer("Заказ не найден.", show_alert=True)
+        return
+
+    if order["status"] in ("delivered", "cancelled", "postponed"):
+        await callback.answer(
+            "Этот заказ нельзя завершить вручную.",
+            show_alert=True,
+        )
+        return
+
+    await callback.message.answer(
+        f"✅ РУЧНОЕ ЗАВЕРШЕНИЕ ЗАКАЗА №{order_id}\n\n"
+        "Выберите причину:",
+        reply_markup=manual_complete_reason_keyboard(order_id),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_complete_reason:"))
+async def admin_complete_reason(callback: CallbackQuery):
+
+    if await deny_admin_callback(callback):
+        return
+
+    _, order_id_raw, reason_key = callback.data.split(":")
+    order_id = int(order_id_raw)
+    reason_text = MANUAL_COMPLETE_REASONS.get(reason_key)
+
+    if not reason_text:
+        await callback.answer("Неизвестная причина.", show_alert=True)
+        return
+
+    await callback.message.answer(
+        f"⚠️ Подтвердите завершение заказа №{order_id}\n\n"
+        f"Причина: {reason_text}\n\n"
+        "Фото/видео и Kaspi-код для ручного завершения не требуются.",
+        reply_markup=manual_complete_confirm_keyboard(order_id, reason_key),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_complete_other:"))
+async def admin_complete_other(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    if await deny_admin_callback(callback):
+        return
+
+    order_id = int(callback.data.split(":")[1])
+    await state.update_data(manual_complete_order_id=order_id)
+    await state.set_state(AdminManualComplete.reason_text)
+
+    await callback.message.answer(
+        f"✍️ Заказ №{order_id}\n\n"
+        "Напишите причину ручного завершения:"
+    )
+    await callback.answer()
+
+
+@dp.message(AdminManualComplete.reason_text)
+async def admin_complete_other_reason_text(
+    message: Message,
+    state: FSMContext,
+):
+
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    reason_text = (message.text or "").strip()
+
+    if not reason_text:
+        await message.answer("❌ Причина не может быть пустой.")
+        return
+
+    data = await state.get_data()
+    order_id = data.get("manual_complete_order_id")
+
+    if not order_id:
+        await state.clear()
+        await message.answer("❌ Заказ не найден.")
+        return
+
+    await state.update_data(manual_complete_reason=reason_text)
+
+    await message.answer(
+        f"⚠️ Подтвердите завершение заказа №{order_id}\n\n"
+        f"Причина: {reason_text}\n\n"
+        "Фото/видео и Kaspi-код не требуются.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="✅ Да, завершить",
+                    callback_data=f"admin_complete_confirm_other:{order_id}",
+                )],
+                [InlineKeyboardButton(
+                    text="↩️ Отмена",
+                    callback_data="cancel_admin_action",
+                )],
+            ]
+        ),
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_complete_confirm:"))
+async def admin_complete_confirm(callback: CallbackQuery):
+
+    if await deny_admin_callback(callback):
+        return
+
+    _, order_id_raw, reason_key = callback.data.split(":")
+    order_id = int(order_id_raw)
+    reason_text = MANUAL_COMPLETE_REASONS.get(reason_key)
+
+    if not reason_text:
+        await callback.answer("Неизвестная причина.", show_alert=True)
+        return
+
+    result = await perform_manual_admin_complete(
+        order_id,
+        callback.from_user.id,
+        reason_text,
+    )
+
+    if not result:
+        await callback.answer(
+            "Заказ уже закрыт или недоступен.",
+            show_alert=True,
+        )
+        return
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        f"✅ Заказ №{order_id} завершён вручную.\n\n"
+        f"Причина: {reason_text}"
+    )
+    await callback.answer("Заказ завершён.")
+
+
+@dp.callback_query(F.data.startswith("admin_complete_confirm_other:"))
+async def admin_complete_confirm_other(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    if await deny_admin_callback(callback):
+        return
+
+    order_id = int(callback.data.split(":")[1])
+    data = await state.get_data()
+    reason_text = (data.get("manual_complete_reason") or "").strip()
+    state_order_id = data.get("manual_complete_order_id")
+
+    if not reason_text or state_order_id != order_id:
+        await callback.answer(
+            "Причина не найдена. Начните заново.",
+            show_alert=True,
+        )
+        return
+
+    result = await perform_manual_admin_complete(
+        order_id,
+        callback.from_user.id,
+        reason_text,
+    )
+
+    if not result:
+        await callback.answer(
+            "Заказ уже закрыт или недоступен.",
+            show_alert=True,
+        )
+        return
+
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        f"✅ Заказ №{order_id} завершён вручную.\n\n"
+        f"Причина: {reason_text}"
+    )
+    await callback.answer("Заказ завершён.")
 
 # =========================================================
 # АДМИН — ОТМЕНА ЗАКАЗА
@@ -12425,7 +12776,7 @@ async def register_order_problem(
         ),
     )
 
-    if ADMIN_IDS:
+    if ADMIN_ID:
 
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -12466,12 +12817,10 @@ async def register_order_problem(
             ]
         )
 
-        for admin_id in ADMIN_IDS:
+        try:
 
-            try:
-
-                await bot.send_message(
-                    admin_id,
+            await bot.send_message(
+                ADMIN_ID,
                     f"⚠️ ПРОБЛЕМА С ЗАКАЗОМ №{order_id}\n\n"
                     f"Причина: {reason}"
                     + (
@@ -12482,14 +12831,15 @@ async def register_order_problem(
                     reply_markup=keyboard,
                 )
 
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     await update_store_status_message(
         order_id
     )
 
     return order
+
 
 
 
@@ -13379,9 +13729,9 @@ async def main():
     )
 
     print(
-        "Admin IDs:",
-        sorted(ADMIN_IDS)
-        if ADMIN_IDS
+        "Admin ID:",
+        ADMIN_ID
+        if ADMIN_ID
         else "NOT SET",
     )
 
