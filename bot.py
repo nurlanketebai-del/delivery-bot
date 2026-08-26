@@ -132,6 +132,14 @@ class QuickOrderCreation(StatesGroup):
     confirm = State()
     edit_value = State()
 
+
+class OrderCreationEdit(StatesGroup):
+    value = State()
+
+
+class ScheduledOrderEdit(StatesGroup):
+    value = State()
+
 class OrderEdit(StatesGroup):
     value = State()
 
@@ -319,6 +327,19 @@ registration_confirm_keyboard = ReplyKeyboardMarkup(
 )
 
 
+
+creation_back_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(
+                text="⬅️ Назад"
+            )
+        ],
+    ],
+    resize_keyboard=True,
+)
+
+
 order_confirm_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [
@@ -331,8 +352,16 @@ order_confirm_keyboard = ReplyKeyboardMarkup(
         ],
         [
             KeyboardButton(
-                text="❌ Отменить заказ"
+                text="✏️ Изменить данные"
             )
+        ],
+        [
+            KeyboardButton(
+                text="⬅️ Назад"
+            ),
+            KeyboardButton(
+                text="❌ Отменить заказ"
+            ),
         ],
     ],
     resize_keyboard=True,
@@ -346,14 +375,15 @@ skip_keyboard = ReplyKeyboardMarkup(
                 text="⏭ Пропустить"
             )
         ],
+        [
+            KeyboardButton(
+                text="⬅️ Назад"
+            )
+        ],
     ],
     resize_keyboard=True,
 )
 
-
-# =========================================================
-# НОВОЕ — КНОПКА ДЛЯ ДОКУМЕНТОВ
-# =========================================================
 
 documents_keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -362,10 +392,14 @@ documents_keyboard = ReplyKeyboardMarkup(
                 text="✅ Готово"
             )
         ],
+        [
+            KeyboardButton(
+                text="⬅️ Назад"
+            )
+        ],
     ],
     resize_keyboard=True,
 )
-
 
 admin_keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -6106,9 +6140,70 @@ async def quick_order_confirm(
         "Заказ создан."
     )
 
+
+async def send_order_creation_preview(
+    message: Message,
+    state: FSMContext,
+):
+
+    data = await state.get_data()
+
+    membership = await get_store_membership(
+        message.from_user.id
+    )
+
+    if not membership:
+
+        await state.clear()
+
+        await message.answer(
+            "❌ Магазин не найден.",
+            reply_markup=store_keyboard,
+        )
+
+        return False
+
+    documents = data.get(
+        "documents",
+        [],
+    )
+
+    await state.set_state(
+        OrderCreation.confirm
+    )
+
+    documents_text = (
+        f"📎 Документов: {len(documents)}"
+        if documents
+        else "📎 Документы: нет"
+    )
+
+    await message.answer(
+        "📦 ПРОВЕРЬТЕ ЗАКАЗ\n\n"
+        f"🏪 Магазин: {membership['store_name']}\n"
+        f"👤 Создал: {membership['full_name']}\n"
+        f"📍 Забрать: {membership['address']}\n\n"
+        f"🔢 Kittek №: "
+        f"{optional_number(data.get('kittek_order_number'))}\n"
+        f"🛒 Kaspi №: "
+        f"{optional_number(data.get('kaspi_order_number'))}\n\n"
+        f"👤 Клиент: {data.get('client_name') or '—'}\n"
+        f"📞 Телефон: {data.get('client_phone') or '—'}\n"
+        f"📍 Доставить: {data.get('delivery_address') or '—'}\n\n"
+        f"📦 Товар: {data.get('item') or '—'}\n"
+        f"🕐 Время: {data.get('delivery_time') or '—'}\n"
+        f"📝 Комментарий: {data.get('comment') or 'Нет'}\n\n"
+        f"{documents_text}\n\n"
+        "Создать заказ?",
+        reply_markup=order_confirm_keyboard,
+    )
+
+    return True
+
 # =========================================================
 # СОЗДАНИЕ ЗАКАЗА
 # =========================================================
+
 
 @dp.message(
     F.text == "➕ Создать заказ"
@@ -6137,7 +6232,6 @@ async def order_start(
 
     await state.clear()
 
-    # Сразу создаём пустой список документов
     await state.update_data(
         documents=[]
     )
@@ -6149,9 +6243,10 @@ async def order_start(
     await message.answer(
         "📦 СОЗДАНИЕ ЗАКАЗА\n\n"
         "👤 Введите имя клиента:",
-
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=creation_back_keyboard,
     )
+
+
 
 
 @dp.message(
@@ -6162,6 +6257,17 @@ async def order_client_name(
     state: FSMContext,
 ):
 
+    if message.text == "⬅️ Назад":
+
+        await state.clear()
+
+        await message.answer(
+            "Создание заказа закрыто.",
+            reply_markup=store_keyboard,
+        )
+
+        return
+
     await state.update_data(
         client_name=message.text
     )
@@ -6171,8 +6277,11 @@ async def order_client_name(
     )
 
     await message.answer(
-        "📞 Введите номер телефона клиента:"
+        "📞 Введите номер телефона клиента:",
+        reply_markup=creation_back_keyboard,
     )
+
+
 
 
 @dp.message(
@@ -6183,6 +6292,19 @@ async def order_client_phone(
     state: FSMContext,
 ):
 
+    if message.text == "⬅️ Назад":
+
+        await state.set_state(
+            OrderCreation.client_name
+        )
+
+        await message.answer(
+            "👤 Введите имя клиента:",
+            reply_markup=creation_back_keyboard,
+        )
+
+        return
+
     await state.update_data(
         client_phone=message.text
     )
@@ -6192,8 +6314,11 @@ async def order_client_phone(
     )
 
     await message.answer(
-        "📍 Введите адрес доставки:"
+        "📍 Введите адрес доставки:",
+        reply_markup=creation_back_keyboard,
     )
+
+
 
 
 @dp.message(
@@ -6203,6 +6328,19 @@ async def order_delivery_address(
     message: Message,
     state: FSMContext,
 ):
+
+    if message.text == "⬅️ Назад":
+
+        await state.set_state(
+            OrderCreation.client_phone
+        )
+
+        await message.answer(
+            "📞 Введите номер телефона клиента:",
+            reply_markup=creation_back_keyboard,
+        )
+
+        return
 
     await state.update_data(
         delivery_address=message.text
@@ -6214,8 +6352,11 @@ async def order_delivery_address(
 
     await message.answer(
         "📦 Что нужно доставить?\n\n"
-        "Например: Холодильник — 1 шт."
+        "Например: Холодильник — 1 шт.",
+        reply_markup=creation_back_keyboard,
     )
+
+
 
 
 @dp.message(
@@ -6225,6 +6366,19 @@ async def order_item(
     message: Message,
     state: FSMContext,
 ):
+
+    if message.text == "⬅️ Назад":
+
+        await state.set_state(
+            OrderCreation.delivery_address
+        )
+
+        await message.answer(
+            "📍 Введите адрес доставки:",
+            reply_markup=creation_back_keyboard,
+        )
+
+        return
 
     await state.update_data(
         item=message.text
@@ -6238,9 +6392,10 @@ async def order_item(
         "🔢 Введите номер заказа по Kittek.\n\n"
         "Если номера нет — "
         "нажмите «⏭ Пропустить».",
-
         reply_markup=skip_keyboard,
     )
+
+
 
 
 @dp.message(
@@ -6250,6 +6405,20 @@ async def order_kittek_number(
     message: Message,
     state: FSMContext,
 ):
+
+    if message.text == "⬅️ Назад":
+
+        await state.set_state(
+            OrderCreation.item
+        )
+
+        await message.answer(
+            "📦 Что нужно доставить?\n\n"
+            "Например: Холодильник — 1 шт.",
+            reply_markup=creation_back_keyboard,
+        )
+
+        return
 
     value = None
 
@@ -6271,9 +6440,10 @@ async def order_kittek_number(
         "🛒 Введите номер заказа по Kaspi.\n\n"
         "Если номера нет — "
         "нажмите «⏭ Пропустить».",
-
         reply_markup=skip_keyboard,
     )
+
+
 
 
 @dp.message(
@@ -6283,6 +6453,21 @@ async def order_kaspi_number(
     message: Message,
     state: FSMContext,
 ):
+
+    if message.text == "⬅️ Назад":
+
+        await state.set_state(
+            OrderCreation.kittek_order_number
+        )
+
+        await message.answer(
+            "🔢 Введите номер заказа по Kittek.\n\n"
+            "Если номера нет — "
+            "нажмите «⏭ Пропустить».",
+            reply_markup=skip_keyboard,
+        )
+
+        return
 
     value = None
 
@@ -6302,9 +6487,10 @@ async def order_kaspi_number(
 
     await message.answer(
         "🕐 Укажите желаемое время доставки:",
-
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=creation_back_keyboard,
     )
+
+
 
 
 @dp.message(
@@ -6314,6 +6500,21 @@ async def order_delivery_time(
     message: Message,
     state: FSMContext,
 ):
+
+    if message.text == "⬅️ Назад":
+
+        await state.set_state(
+            OrderCreation.kaspi_order_number
+        )
+
+        await message.answer(
+            "🛒 Введите номер заказа по Kaspi.\n\n"
+            "Если номера нет — "
+            "нажмите «⏭ Пропустить».",
+            reply_markup=skip_keyboard,
+        )
+
+        return
 
     await state.update_data(
         delivery_time=message.text
@@ -6326,13 +6527,16 @@ async def order_delivery_time(
     await message.answer(
         "📝 Добавьте комментарий.\n\n"
         "Если комментария нет — "
-        "напишите: Нет"
+        "напишите: Нет",
+        reply_markup=creation_back_keyboard,
     )
+
 
 
 # =========================================================
 # ИЗМЕНЕНО — ПОСЛЕ КОММЕНТАРИЯ ИДУТ ДОКУМЕНТЫ
 # =========================================================
+
 
 @dp.message(
     OrderCreation.comment
@@ -6341,6 +6545,19 @@ async def order_comment(
     message: Message,
     state: FSMContext,
 ):
+
+    if message.text == "⬅️ Назад":
+
+        await state.set_state(
+            OrderCreation.delivery_time
+        )
+
+        await message.answer(
+            "🕐 Укажите желаемое время доставки:",
+            reply_markup=creation_back_keyboard,
+        )
+
+        return
 
     await state.update_data(
         comment=message.text
@@ -6352,19 +6569,16 @@ async def order_comment(
 
     await message.answer(
         "📎 ДОКУМЕНТЫ К ЗАКАЗУ\n\n"
-
         "Отправьте нужные документы.\n"
         "Можно отправить несколько файлов — "
         "по одному или сразу несколько.\n\n"
-
         "Когда все документы будут добавлены, "
         "нажмите «✅ Готово».\n\n"
-
         "Если документов нет — "
         "просто нажмите «✅ Готово».",
-
         reply_markup=documents_keyboard,
     )
+
 
 
 # =========================================================
@@ -6417,6 +6631,7 @@ async def order_document_received(
 # НОВОЕ — НАЖАЛИ "ГОТОВО"
 # =========================================================
 
+
 @dp.message(
     OrderCreation.documents,
     F.text == "✅ Готово",
@@ -6426,105 +6641,297 @@ async def order_documents_done(
     state: FSMContext,
 ):
 
-    data = await state.get_data()
-
-    membership = await get_store_membership(
-        message.from_user.id
+    await send_order_creation_preview(
+        message,
+        state,
     )
 
-    if not membership:
-
-        await state.clear()
-
-        await message.answer(
-            "❌ Магазин не найден."
-        )
-
-        return
-
-    documents = data.get(
-        "documents",
-        [],
-    )
-
-    await state.set_state(
-        OrderCreation.confirm
-    )
-
-    documents_text = (
-        f"📎 Документов: {len(documents)}"
-        if documents
-        else "📎 Документы: нет"
-    )
-
-    await message.answer(
-        "📦 ПРОВЕРЬТЕ ЗАКАЗ\n\n"
-
-        f"🏪 Магазин: "
-        f"{membership['store_name']}\n"
-
-        f"👤 Создал: "
-        f"{membership['full_name']}\n"
-
-        f"📍 Забрать: "
-        f"{membership['address']}\n\n"
-
-        f"🔢 Kittek №: "
-        f"{optional_number(data.get('kittek_order_number'))}\n"
-
-        f"🛒 Kaspi №: "
-        f"{optional_number(data.get('kaspi_order_number'))}\n\n"
-
-        f"👤 Клиент: "
-        f"{data['client_name']}\n"
-
-        f"📞 Телефон: "
-        f"{data['client_phone']}\n"
-
-        f"📍 Доставить: "
-        f"{data['delivery_address']}\n\n"
-
-        f"📦 Товар: "
-        f"{data['item']}\n"
-
-        f"🕐 Время: "
-        f"{data['delivery_time']}\n"
-
-        f"📝 Комментарий: "
-        f"{data['comment']}\n\n"
-
-        f"{documents_text}\n\n"
-
-        "Создать заказ?",
-
-        reply_markup=order_confirm_keyboard,
-    )
 
 
 # =========================================================
 # НОВОЕ — ЕСЛИ НА ЭТАПЕ ДОКУМЕНТОВ ПРИШЛО НЕ ТО
 # =========================================================
 
+
 @dp.message(
     OrderCreation.documents
 )
 async def order_document_wrong(
-    message: Message
+    message: Message,
+    state: FSMContext,
 ):
+
+    if message.text == "⬅️ Назад":
+
+        await state.set_state(
+            OrderCreation.comment
+        )
+
+        await message.answer(
+            "📝 Добавьте комментарий.\n\n"
+            "Если комментария нет — "
+            "напишите: Нет",
+            reply_markup=creation_back_keyboard,
+        )
+
+        return
 
     await message.answer(
         "📎 На этом этапе отправьте файл "
         "как документ.\n\n"
         "Когда закончите — "
         "нажмите «✅ Готово».",
-
         reply_markup=documents_keyboard,
     )
+
 
 
 # =========================================================
 # ИЗМЕНЕНО — СОЗДАНИЕ ЗАКАЗА + СОХРАНЕНИЕ ДОКУМЕНТОВ
 # =========================================================
+
+
+@dp.message(
+    OrderCreation.confirm,
+    F.text == "⬅️ Назад",
+)
+async def order_confirm_back(
+    message: Message,
+    state: FSMContext,
+):
+
+    await state.set_state(
+        OrderCreation.documents
+    )
+
+    data = await state.get_data()
+
+    documents = data.get(
+        "documents",
+        [],
+    )
+
+    await message.answer(
+        "📎 ДОКУМЕНТЫ К ЗАКАЗУ\n\n"
+        f"Сейчас документов: {len(documents)}\n\n"
+        "Можно добавить ещё документы "
+        "или нажать «✅ Готово».",
+        reply_markup=documents_keyboard,
+    )
+
+
+@dp.message(
+    OrderCreation.confirm,
+    F.text == "✏️ Изменить данные",
+)
+async def order_creation_edit_menu(
+    message: Message,
+):
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="👤 Имя клиента",
+                callback_data="creation_edit:client_name",
+            )],
+            [InlineKeyboardButton(
+                text="📞 Телефон",
+                callback_data="creation_edit:client_phone",
+            )],
+            [InlineKeyboardButton(
+                text="📍 Адрес доставки",
+                callback_data="creation_edit:delivery_address",
+            )],
+            [InlineKeyboardButton(
+                text="📦 Товар",
+                callback_data="creation_edit:item",
+            )],
+            [InlineKeyboardButton(
+                text="🔢 Kittek №",
+                callback_data="creation_edit:kittek_order_number",
+            )],
+            [InlineKeyboardButton(
+                text="🛒 Kaspi №",
+                callback_data="creation_edit:kaspi_order_number",
+            )],
+            [InlineKeyboardButton(
+                text="🕐 Время доставки",
+                callback_data="creation_edit:delivery_time",
+            )],
+            [InlineKeyboardButton(
+                text="📝 Комментарий",
+                callback_data="creation_edit:comment",
+            )],
+            [InlineKeyboardButton(
+                text="↩️ Назад к заказу",
+                callback_data="creation_edit_cancel",
+            )],
+        ]
+    )
+
+    await message.answer(
+        "✏️ Что изменить перед созданием заказа?",
+        reply_markup=keyboard,
+    )
+
+
+@dp.callback_query(
+    F.data.startswith("creation_edit:")
+)
+async def order_creation_edit_field(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    field = callback.data.split(
+        ":",
+        1,
+    )[1]
+
+    allowed = {
+        "client_name",
+        "client_phone",
+        "delivery_address",
+        "item",
+        "kittek_order_number",
+        "kaspi_order_number",
+        "delivery_time",
+        "comment",
+    }
+
+    if field not in allowed:
+
+        await callback.answer(
+            "Неизвестное поле.",
+            show_alert=True,
+        )
+
+        return
+
+    await state.update_data(
+        creation_edit_field=field
+    )
+
+    await state.set_state(
+        OrderCreationEdit.value
+    )
+
+    await callback.message.answer(
+        "✏️ Введите новое значение.\n\n"
+        "Для Kittek/Kaspi можно написать «-», "
+        "чтобы очистить номер.\n"
+        "Нажмите «⬅️ Назад», чтобы ничего не менять.",
+        reply_markup=creation_back_keyboard,
+    )
+
+    await callback.answer()
+
+
+@dp.message(
+    OrderCreationEdit.value
+)
+async def order_creation_edit_value(
+    message: Message,
+    state: FSMContext,
+):
+
+    if message.text == "⬅️ Назад":
+
+        await send_order_creation_preview(
+            message,
+            state,
+        )
+
+        return
+
+    data = await state.get_data()
+
+    field = data.get(
+        "creation_edit_field"
+    )
+
+    allowed = {
+        "client_name",
+        "client_phone",
+        "delivery_address",
+        "item",
+        "kittek_order_number",
+        "kaspi_order_number",
+        "delivery_time",
+        "comment",
+    }
+
+    if field not in allowed:
+
+        await state.set_state(
+            OrderCreation.confirm
+        )
+
+        await message.answer(
+            "❌ Поле для редактирования не найдено.",
+            reply_markup=order_confirm_keyboard,
+        )
+
+        return
+
+    value = (
+        message.text or ""
+    ).strip()
+
+    if field in {
+        "kittek_order_number",
+        "kaspi_order_number",
+    }:
+
+        if value.lower() in {
+            "-",
+            "нет",
+            "none",
+            "пропустить",
+        }:
+
+            value = None
+
+    elif not value:
+
+        await message.answer(
+            "❌ Значение не может быть пустым.",
+            reply_markup=creation_back_keyboard,
+        )
+
+        return
+
+    await state.update_data(
+        **{
+            field: value,
+            "creation_edit_field": None,
+        }
+    )
+
+    await send_order_creation_preview(
+        message,
+        state,
+    )
+
+
+@dp.callback_query(
+    F.data == "creation_edit_cancel"
+)
+async def order_creation_edit_cancel(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    await state.set_state(
+        OrderCreation.confirm
+    )
+
+    await callback.message.answer(
+        "Возвращаюсь к подтверждению заказа.",
+        reply_markup=order_confirm_keyboard,
+    )
+
+    await callback.answer()
 
 @dp.message(
     OrderCreation.confirm,
@@ -6667,6 +7074,7 @@ async def order_confirm(
     await publish_new_order(order_id)
 
 
+
 @dp.message(
     OrderCreation.confirm,
     F.text == "🕒 Отправить позже",
@@ -6675,9 +7083,14 @@ async def order_schedule_start(
     message: Message,
     state: FSMContext,
 ):
-    await state.set_state(OrderCreation.schedule_time)
 
-    now = datetime.now(LOCAL_TZ)
+    await state.set_state(
+        OrderCreation.schedule_time
+    )
+
+    now = datetime.now(
+        LOCAL_TZ
+    )
 
     await message.answer(
         "🕒 ОТЛОЖЕННЫЙ ЗАКАЗ\n\n"
@@ -6686,52 +7099,87 @@ async def order_schedule_start(
         "Формат: ДД.ММ.ГГГГ ЧЧ:ММ\n"
         "Например: 20.08.2026 14:30\n\n"
         f"Сейчас: {now.strftime('%d.%m.%Y %H:%M')}",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=creation_back_keyboard,
     )
 
 
-@dp.message(OrderCreation.schedule_time)
+
+
+@dp.message(
+    OrderCreation.schedule_time
+)
 async def order_schedule_save(
     message: Message,
     state: FSMContext,
 ):
-    scheduled_for = parse_scheduled_datetime(message.text)
-    now = datetime.now(LOCAL_TZ)
+
+    if message.text == "⬅️ Назад":
+
+        await send_order_creation_preview(
+            message,
+            state,
+        )
+
+        return
+
+    scheduled_for = parse_scheduled_datetime(
+        message.text
+    )
+
+    now = datetime.now(
+        LOCAL_TZ
+    )
 
     if not scheduled_for:
+
         await message.answer(
             "❌ Не понял дату и время.\n\n"
-            "Введите так: 20.08.2026 14:30"
+            "Введите так: 20.08.2026 14:30",
+            reply_markup=creation_back_keyboard,
         )
+
         return
 
     if scheduled_for <= now:
+
         await message.answer(
             "❌ Время должно быть в будущем.\n\n"
             "Введите новую дату и время, например: "
-            "20.08.2026 14:30"
+            "20.08.2026 14:30",
+            reply_markup=creation_back_keyboard,
         )
+
         return
 
     data = await state.get_data()
 
-    membership = await get_store_membership(message.from_user.id)
+    membership = await get_store_membership(
+        message.from_user.id
+    )
 
     if (
         not membership
         or membership["status"] != "approved"
     ):
+
         await state.clear()
+
         await message.answer(
             "❌ Магазин недоступен.",
             reply_markup=store_keyboard,
         )
+
         return
 
-    documents = data.get("documents", [])
+    documents = data.get(
+        "documents",
+        [],
+    )
 
     async with db_pool.acquire() as conn:
+
         async with conn.transaction():
+
             scheduled_id = await conn.fetchval(
                 """
                 INSERT INTO scheduled_orders (
@@ -6766,6 +7214,7 @@ async def order_schedule_save(
             )
 
             for document in documents:
+
                 await conn.execute(
                     """
                     INSERT INTO scheduled_order_documents (
@@ -6792,11 +7241,10 @@ async def order_schedule_save(
         f"{scheduled_for.strftime('%d.%m.%Y %H:%M')}\n"
         f"📎 Документов: {len(documents)}\n\n"
         "До этого времени он не попадёт в обычные заказы "
-        "и не будет отправлен в группу.\n"
-        "В указанное время бот создаст обычный заказ "
-        "и отправит его автоматически.",
+        "и не будет отправлен в группу.",
         reply_markup=store_keyboard,
     )
+
 
 
 @dp.message(
@@ -6817,70 +7265,104 @@ async def order_cancel(
     )
 
 
-# =========================================================
-# МОИ ЗАКАЗЫ
-# =========================================================
 
-@dp.message(
-    F.text == "📦 Мои заказы"
-)
-async def store_orders(
-    message: Message
-):
+def store_orders_section_keyboard():
 
-    membership = await get_store_membership(
-        message.from_user.id
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="👤 Мои заказы",
+                callback_data="store_orders_mine",
+            )],
+            [InlineKeyboardButton(
+                text="🏪 Все заказы магазина",
+                callback_data="store_orders_all",
+            )],
+            [InlineKeyboardButton(
+                text="🕐 Отложенные заказы",
+                callback_data="store_orders_scheduled",
+            )],
+        ]
     )
 
-    if not membership:
 
-        await message.answer(
-            "❌ Магазин не найден."
-        )
-
-        return
+async def send_regular_store_orders(
+    target_message: Message,
+    membership,
+    viewer_id: int,
+    mine_only: bool,
+):
 
     async with db_pool.acquire() as conn:
 
-        orders = await conn.fetch(
-            """
-            SELECT
-                o.*,
+        if mine_only:
 
-                su.full_name
-                    AS created_by,
+            orders = await conn.fetch(
+                """
+                SELECT
+                    o.*,
+                    su.full_name AS created_by,
+                    c.full_name AS courier_name,
+                    (
+                        SELECT COUNT(*)
+                        FROM order_documents od
+                        WHERE od.order_id = o.id
+                    ) AS documents_count
 
-                c.full_name
-                    AS courier_name,
+                FROM orders o
 
-                (
-                    SELECT COUNT(*)
-                    FROM order_documents od
-                    WHERE od.order_id = o.id
-                ) AS documents_count
+                LEFT JOIN store_users su
+                    ON su.telegram_id = o.created_by_telegram_id
 
-            FROM orders o
+                LEFT JOIN couriers c
+                    ON c.id = o.courier_id
 
-            LEFT JOIN store_users su
-                ON su.telegram_id =
-                   o.created_by_telegram_id
+                WHERE o.store_id = $1
+                  AND o.created_by_telegram_id = $2
 
-            LEFT JOIN couriers c
-                ON c.id = o.courier_id
+                ORDER BY o.id DESC
 
-            WHERE o.store_id = $1
+                LIMIT 20
+                """,
+                membership["store_id"],
+                viewer_id,
+            )
 
-            ORDER BY o.id DESC
+        else:
 
-            LIMIT 20
-            """,
-            membership["store_id"],
-        )
+            orders = await conn.fetch(
+                """
+                SELECT
+                    o.*,
+                    su.full_name AS created_by,
+                    c.full_name AS courier_name,
+                    (
+                        SELECT COUNT(*)
+                        FROM order_documents od
+                        WHERE od.order_id = o.id
+                    ) AS documents_count
+
+                FROM orders o
+
+                LEFT JOIN store_users su
+                    ON su.telegram_id = o.created_by_telegram_id
+
+                LEFT JOIN couriers c
+                    ON c.id = o.courier_id
+
+                WHERE o.store_id = $1
+
+                ORDER BY o.id DESC
+
+                LIMIT 20
+                """,
+                membership["store_id"],
+            )
 
     if not orders:
 
-        await message.answer(
-            "📦 У магазина пока нет заказов."
+        await target_message.answer(
+            "📦 Заказов в этом разделе пока нет."
         )
 
         return
@@ -6894,22 +7376,30 @@ async def store_orders(
 
         buttons = []
 
-        if order["status"] == "new":
+        can_edit = (
+            order["status"] in (
+                "new",
+                "postponed",
+            )
+            and (
+                order["created_by_telegram_id"] == viewer_id
+                or membership["member_role"] == "owner"
+            )
+        )
+
+        if can_edit:
 
             buttons.append([
                 InlineKeyboardButton(
                     text="✏️ Редактировать",
                     callback_data=(
-                        f"edit_order:"
-                        f"{order['id']}"
+                        f"edit_order:{order['id']}"
                     ),
                 )
             ])
 
-        # Перенос / перевыпуск доступен именно создателю заказа.
         if (
-            order["created_by_telegram_id"]
-            == message.from_user.id
+            order["created_by_telegram_id"] == viewer_id
             and order["status"] in (
                 "new",
                 "postponed",
@@ -6920,15 +7410,13 @@ async def store_orders(
                 InlineKeyboardButton(
                     text="🗓 Перенести заказ",
                     callback_data=(
-                        f"store_reschedule:"
-                        f"{order['id']}"
+                        f"store_reschedule:{order['id']}"
                     ),
                 )
             ])
 
         if (
-            order["created_by_telegram_id"]
-            == message.from_user.id
+            order["created_by_telegram_id"] == viewer_id
             and order["status"] == "postponed"
         ):
 
@@ -6936,8 +7424,7 @@ async def store_orders(
                 InlineKeyboardButton(
                     text="🚀 Перевыпустить сейчас",
                     callback_data=(
-                        f"store_release_now:"
-                        f"{order['id']}"
+                        f"store_release_now:{order['id']}"
                     ),
                 )
             ])
@@ -6946,8 +7433,7 @@ async def store_orders(
             InlineKeyboardButton(
                 text="🕐 История",
                 callback_data=(
-                    f"store_history:"
-                    f"{order['id']}"
+                    f"store_history:{order['id']}"
                 ),
             )
         ])
@@ -7003,61 +7489,270 @@ async def store_orders(
             if order["problem_details"]:
 
                 problem_text += (
-                    f"\n📝 "
-                    f"{order['problem_details']}"
+                    f"\n📝 {order['problem_details']}"
                 )
 
-        await message.answer(
-            f"📦 ЗАКАЗ №"
-            f"{order['id']}\n\n"
-
+        await target_message.answer(
+            f"📦 ЗАКАЗ №{order['id']}\n\n"
             f"Статус: "
             f"{STATUS_NAMES.get(order['status'], order['status'])}\n"
-
             f"💰 Стоимость: "
             f"{price_text(order['delivery_price'])}\n\n"
-
             f"🔢 Kittek №: "
             f"{optional_number(order['kittek_order_number'])}\n"
-
             f"🛒 Kaspi №: "
             f"{optional_number(order['kaspi_order_number'])}\n\n"
-
             f"📎 Документов: "
             f"{order['documents_count']}\n\n"
-
-            f"👤 Создал: "
-            f"{author}\n"
-
-            f"👤 Клиент: "
-            f"{order['client_name']}\n"
-
-            f"📞 "
-            f"{order['client_phone']}\n"
-
-            f"📍 "
-            f"{order['delivery_address']}\n"
-
-            f"📦 "
-            f"{order['item']}\n"
-
-            f"🕐 "
-            f"{order['delivery_time']}\n"
-
-            f"📝 "
-            f"{order['comment']}\n\n"
-
-            f"🚚 Курьер: "
-            f"{courier_text}"
+            f"👤 Создал: {author}\n"
+            f"👤 Клиент: {order['client_name']}\n"
+            f"📞 {order['client_phone']}\n"
+            f"📍 {order['delivery_address']}\n"
+            f"📦 {order['item']}\n"
+            f"🕐 {order['delivery_time']}\n"
+            f"📝 {order['comment']}\n\n"
+            f"🚚 Курьер: {courier_text}"
             f"{queue_text}"
             f"{postponed_text}"
             f"{problem_text}",
-
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=buttons
             ),
         )
 
+
+async def send_scheduled_store_orders(
+    target_message: Message,
+    membership,
+    viewer_id: int,
+):
+
+    async with db_pool.acquire() as conn:
+
+        rows = await conn.fetch(
+            """
+            SELECT
+                so.*,
+                su.full_name AS created_by,
+                (
+                    SELECT COUNT(*)
+                    FROM scheduled_order_documents sod
+                    WHERE sod.scheduled_order_id = so.id
+                ) AS documents_count
+
+            FROM scheduled_orders so
+
+            LEFT JOIN store_users su
+                ON su.telegram_id = so.created_by_telegram_id
+
+            WHERE so.store_id = $1
+              AND so.status = 'scheduled'
+
+            ORDER BY
+                so.scheduled_for ASC,
+                so.id ASC
+
+            LIMIT 50
+            """,
+            membership["store_id"],
+        )
+
+    if not rows:
+
+        await target_message.answer(
+            "🕐 Отложенных заказов сейчас нет."
+        )
+
+        return
+
+    await target_message.answer(
+        "🕐 ОТЛОЖЕННЫЕ ЗАКАЗЫ\n\n"
+        "Здесь находятся заказы, которые ещё "
+        "не опубликованы и ждут своего времени."
+    )
+
+    for row in rows:
+
+        local_time = row[
+            "scheduled_for"
+        ].astimezone(
+            LOCAL_TZ
+        )
+
+        can_edit = (
+            row["created_by_telegram_id"] == viewer_id
+            or membership["member_role"] == "owner"
+        )
+
+        buttons = []
+
+        if can_edit:
+
+            buttons.append([
+                InlineKeyboardButton(
+                    text="✏️ Редактировать",
+                    callback_data=(
+                        f"edit_scheduled:{row['id']}"
+                    ),
+                )
+            ])
+
+        await target_message.answer(
+            f"🕐 ОТЛОЖЕННЫЙ №{row['id']}\n\n"
+            f"🗓 Публикация: "
+            f"{local_time.strftime('%d.%m.%Y %H:%M')}\n"
+            f"🔢 Kittek №: "
+            f"{optional_number(row['kittek_order_number'])}\n"
+            f"🛒 Kaspi №: "
+            f"{optional_number(row['kaspi_order_number'])}\n\n"
+            f"👤 Создал: "
+            f"{row['created_by'] or 'Не указан'}\n"
+            f"👤 Клиент: {row['client_name']}\n"
+            f"📞 {row['client_phone']}\n"
+            f"📍 {row['delivery_address']}\n"
+            f"📦 {row['item']}\n"
+            f"🕐 Доставка: {row['delivery_time']}\n"
+            f"📝 {row['comment'] or 'Нет'}\n"
+            f"📎 Документов: {row['documents_count']}",
+            reply_markup=(
+                InlineKeyboardMarkup(
+                    inline_keyboard=buttons
+                )
+                if buttons
+                else None
+            ),
+        )
+
+# =========================================================
+# МОИ ЗАКАЗЫ
+# =========================================================
+
+
+@dp.message(
+    F.text == "📦 Мои заказы"
+)
+async def store_orders(
+    message: Message
+):
+
+    membership = await get_store_membership(
+        message.from_user.id
+    )
+
+    if not membership:
+
+        await message.answer(
+            "❌ Магазин не найден."
+        )
+
+        return
+
+    await message.answer(
+        "📦 ЗАКАЗЫ\n\n"
+        "Выберите раздел:",
+        reply_markup=store_orders_section_keyboard(),
+    )
+
+
+
+
+@dp.callback_query(
+    F.data == "store_orders_mine"
+)
+async def store_orders_mine(
+    callback: CallbackQuery
+):
+
+    membership = await get_store_membership(
+        callback.from_user.id
+    )
+
+    if not membership:
+
+        await callback.answer(
+            "Магазин не найден.",
+            show_alert=True,
+        )
+
+        return
+
+    await callback.message.answer(
+        "👤 МОИ ЗАКАЗЫ\n\n"
+        "Показываю заказы, созданные именно вами."
+    )
+
+    await send_regular_store_orders(
+        callback.message,
+        membership,
+        callback.from_user.id,
+        mine_only=True,
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data == "store_orders_all"
+)
+async def store_orders_all(
+    callback: CallbackQuery
+):
+
+    membership = await get_store_membership(
+        callback.from_user.id
+    )
+
+    if not membership:
+
+        await callback.answer(
+            "Магазин не найден.",
+            show_alert=True,
+        )
+
+        return
+
+    await callback.message.answer(
+        "🏪 ВСЕ ЗАКАЗЫ МАГАЗИНА\n\n"
+        "Показываю последние заказы всех менеджеров."
+    )
+
+    await send_regular_store_orders(
+        callback.message,
+        membership,
+        callback.from_user.id,
+        mine_only=False,
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data == "store_orders_scheduled"
+)
+async def store_orders_scheduled(
+    callback: CallbackQuery
+):
+
+    membership = await get_store_membership(
+        callback.from_user.id
+    )
+
+    if not membership:
+
+        await callback.answer(
+            "Магазин не найден.",
+            show_alert=True,
+        )
+
+        return
+
+    await send_scheduled_store_orders(
+        callback.message,
+        membership,
+        callback.from_user.id,
+    )
+
+    await callback.answer()
 
 # =========================================================
 # ИСТОРИЯ МАГАЗИНА
@@ -7168,9 +7863,445 @@ async def store_history(
     await callback.answer()
 
 
+
+@dp.callback_query(
+    F.data.startswith("edit_scheduled:")
+)
+async def edit_scheduled_order_menu(
+    callback: CallbackQuery
+):
+
+    scheduled_id = int(
+        callback.data.split(":")[1]
+    )
+
+    membership = await get_store_membership(
+        callback.from_user.id
+    )
+
+    if not membership:
+
+        await callback.answer(
+            "Магазин не найден.",
+            show_alert=True,
+        )
+
+        return
+
+    async with db_pool.acquire() as conn:
+
+        row = await conn.fetchrow(
+            """
+            SELECT *
+
+            FROM scheduled_orders
+
+            WHERE id = $1
+              AND store_id = $2
+              AND status = 'scheduled'
+            """,
+            scheduled_id,
+            membership["store_id"],
+        )
+
+    can_edit = (
+        row
+        and (
+            row["created_by_telegram_id"] == callback.from_user.id
+            or membership["member_role"] == "owner"
+        )
+    )
+
+    if not can_edit:
+
+        await callback.answer(
+            "❌ Отложенный заказ недоступен для редактирования.",
+            show_alert=True,
+        )
+
+        return
+
+    local_time = row[
+        "scheduled_for"
+    ].astimezone(
+        LOCAL_TZ
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="👤 Имя клиента",
+                callback_data=f"scheduled_edit:{scheduled_id}:client_name",
+            )],
+            [InlineKeyboardButton(
+                text="📞 Телефон",
+                callback_data=f"scheduled_edit:{scheduled_id}:client_phone",
+            )],
+            [InlineKeyboardButton(
+                text="📍 Адрес доставки",
+                callback_data=f"scheduled_edit:{scheduled_id}:delivery_address",
+            )],
+            [InlineKeyboardButton(
+                text="📦 Товар",
+                callback_data=f"scheduled_edit:{scheduled_id}:item",
+            )],
+            [InlineKeyboardButton(
+                text="🔢 Kittek №",
+                callback_data=f"scheduled_edit:{scheduled_id}:kittek_order_number",
+            )],
+            [InlineKeyboardButton(
+                text="🛒 Kaspi №",
+                callback_data=f"scheduled_edit:{scheduled_id}:kaspi_order_number",
+            )],
+            [InlineKeyboardButton(
+                text="🕐 Время доставки",
+                callback_data=f"scheduled_edit:{scheduled_id}:delivery_time",
+            )],
+            [InlineKeyboardButton(
+                text="📝 Комментарий",
+                callback_data=f"scheduled_edit:{scheduled_id}:comment",
+            )],
+            [InlineKeyboardButton(
+                text="🗓 Время публикации",
+                callback_data=f"scheduled_edit:{scheduled_id}:scheduled_for",
+            )],
+        ]
+    )
+
+    await callback.message.answer(
+        f"✏️ ОТЛОЖЕННЫЙ ЗАКАЗ №{scheduled_id}\n\n"
+        f"🗓 Публикация: "
+        f"{local_time.strftime('%d.%m.%Y %H:%M')}\n"
+        f"🔢 Kittek №: "
+        f"{optional_number(row['kittek_order_number'])}\n"
+        f"🛒 Kaspi №: "
+        f"{optional_number(row['kaspi_order_number'])}\n"
+        f"👤 {row['client_name']}\n"
+        f"📞 {row['client_phone']}\n"
+        f"📍 {row['delivery_address']}\n"
+        f"📦 {row['item']}\n"
+        f"🕐 {row['delivery_time']}\n"
+        f"📝 {row['comment'] or 'Нет'}\n\n"
+        "Что изменить?",
+        reply_markup=keyboard,
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data.startswith("scheduled_edit:")
+)
+async def edit_scheduled_order_field(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    _, scheduled_id_raw, field = callback.data.split(
+        ":",
+        2,
+    )
+
+    scheduled_id = int(
+        scheduled_id_raw
+    )
+
+    allowed = {
+        "client_name",
+        "client_phone",
+        "delivery_address",
+        "item",
+        "kittek_order_number",
+        "kaspi_order_number",
+        "delivery_time",
+        "comment",
+        "scheduled_for",
+    }
+
+    if field not in allowed:
+
+        await callback.answer(
+            "Неизвестное поле.",
+            show_alert=True,
+        )
+
+        return
+
+    membership = await get_store_membership(
+        callback.from_user.id
+    )
+
+    if not membership:
+
+        await callback.answer(
+            "Магазин не найден.",
+            show_alert=True,
+        )
+
+        return
+
+    async with db_pool.acquire() as conn:
+
+        row = await conn.fetchrow(
+            """
+            SELECT
+                created_by_telegram_id
+
+            FROM scheduled_orders
+
+            WHERE id = $1
+              AND store_id = $2
+              AND status = 'scheduled'
+            """,
+            scheduled_id,
+            membership["store_id"],
+        )
+
+    if (
+        not row
+        or (
+            row["created_by_telegram_id"] != callback.from_user.id
+            and membership["member_role"] != "owner"
+        )
+    ):
+
+        await callback.answer(
+            "❌ Этот отложенный заказ уже нельзя редактировать.",
+            show_alert=True,
+        )
+
+        return
+
+    await state.update_data(
+        scheduled_edit_id=scheduled_id,
+        scheduled_edit_field=field,
+    )
+
+    await state.set_state(
+        ScheduledOrderEdit.value
+    )
+
+    if field == "scheduled_for":
+
+        prompt = (
+            "🗓 Введите новую дату и время публикации.\n\n"
+            "Формат: ДД.ММ.ГГГГ ЧЧ:ММ"
+        )
+
+    else:
+
+        prompt = (
+            "✏️ Введите новое значение.\n\n"
+            "Для Kittek/Kaspi можно написать «-», "
+            "чтобы очистить номер."
+        )
+
+    await callback.message.answer(
+        prompt,
+        reply_markup=creation_back_keyboard,
+    )
+
+    await callback.answer()
+
+
+@dp.message(
+    ScheduledOrderEdit.value
+)
+async def save_scheduled_order_edit(
+    message: Message,
+    state: FSMContext,
+):
+
+    if message.text == "⬅️ Назад":
+
+        await state.clear()
+
+        await message.answer(
+            "Редактирование отменено.",
+            reply_markup=store_keyboard,
+        )
+
+        return
+
+    data = await state.get_data()
+
+    scheduled_id = data.get(
+        "scheduled_edit_id"
+    )
+
+    field = data.get(
+        "scheduled_edit_field"
+    )
+
+    allowed = {
+        "client_name",
+        "client_phone",
+        "delivery_address",
+        "item",
+        "kittek_order_number",
+        "kaspi_order_number",
+        "delivery_time",
+        "comment",
+        "scheduled_for",
+    }
+
+    if (
+        not scheduled_id
+        or field not in allowed
+    ):
+
+        await state.clear()
+
+        await message.answer(
+            "❌ Ошибка редактирования.",
+            reply_markup=store_keyboard,
+        )
+
+        return
+
+    raw_value = (
+        message.text or ""
+    ).strip()
+
+    if field == "scheduled_for":
+
+        value = parse_scheduled_datetime(
+            raw_value
+        )
+
+        if not value:
+
+            await message.answer(
+                "❌ Не понял дату и время.\n"
+                "Введите так: 20.08.2026 14:30",
+                reply_markup=creation_back_keyboard,
+            )
+
+            return
+
+        if value <= datetime.now(
+            LOCAL_TZ
+        ):
+
+            await message.answer(
+                "❌ Время публикации должно быть в будущем.",
+                reply_markup=creation_back_keyboard,
+            )
+
+            return
+
+    else:
+
+        value = raw_value
+
+        if field in {
+            "kittek_order_number",
+            "kaspi_order_number",
+        }:
+
+            if raw_value.lower() in {
+                "-",
+                "нет",
+                "none",
+                "пропустить",
+            }:
+
+                value = None
+
+        elif not raw_value:
+
+            await message.answer(
+                "❌ Значение не может быть пустым.",
+                reply_markup=creation_back_keyboard,
+            )
+
+            return
+
+    membership = await get_store_membership(
+        message.from_user.id
+    )
+
+    if not membership:
+
+        await state.clear()
+
+        await message.answer(
+            "❌ Магазин не найден.",
+            reply_markup=store_keyboard,
+        )
+
+        return
+
+    async with db_pool.acquire() as conn:
+
+        row = await conn.fetchrow(
+            """
+            SELECT
+                created_by_telegram_id
+
+            FROM scheduled_orders
+
+            WHERE id = $1
+              AND store_id = $2
+              AND status = 'scheduled'
+            """,
+            scheduled_id,
+            membership["store_id"],
+        )
+
+        allowed_to_edit = (
+            row
+            and (
+                row["created_by_telegram_id"] == message.from_user.id
+                or membership["member_role"] == "owner"
+            )
+        )
+
+        if not allowed_to_edit:
+
+            updated = None
+
+        else:
+
+            updated = await conn.fetchrow(
+                f"""
+                UPDATE scheduled_orders
+
+                SET
+                    {field} = $1,
+                    last_error = NULL
+
+                WHERE id = $2
+                  AND store_id = $3
+                  AND status = 'scheduled'
+
+                RETURNING id
+                """,
+                value,
+                scheduled_id,
+                membership["store_id"],
+            )
+
+    await state.clear()
+
+    if not updated:
+
+        await message.answer(
+            "❌ Отложенный заказ уже недоступен.",
+            reply_markup=store_keyboard,
+        )
+
+        return
+
+    await message.answer(
+        f"✅ Отложенный заказ №{scheduled_id} обновлён.",
+        reply_markup=store_keyboard,
+    )
+
 # =========================================================
 # РЕДАКТИРОВАНИЕ ЗАКАЗА
 # =========================================================
+
 
 @dp.callback_query(
     F.data.startswith(
@@ -7222,11 +8353,21 @@ async def edit_order_menu(
 
         return
 
-    if order["status"] != "new":
+    can_edit = (
+        order["status"] in (
+            "new",
+            "postponed",
+        )
+        and (
+            order["created_by_telegram_id"] == callback.from_user.id
+            or membership["member_role"] == "owner"
+        )
+    )
+
+    if not can_edit:
 
         await callback.answer(
-            "❌ После назначения курьера "
-            "заказ редактировать нельзя.",
+            "❌ Этот заказ сейчас нельзя редактировать.",
             show_alert=True,
         )
 
@@ -7234,117 +8375,60 @@ async def edit_order_menu(
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="👤 Имя клиента",
-                    callback_data=(
-                        f"edit_field:"
-                        f"{order_id}:client_name"
-                    ),
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📞 Телефон",
-                    callback_data=(
-                        f"edit_field:"
-                        f"{order_id}:client_phone"
-                    ),
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📍 Адрес доставки",
-                    callback_data=(
-                        f"edit_field:"
-                        f"{order_id}:delivery_address"
-                    ),
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📦 Товар",
-                    callback_data=(
-                        f"edit_field:"
-                        f"{order_id}:item"
-                    ),
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔢 Kittek №",
-                    callback_data=(
-                        f"edit_field:"
-                        f"{order_id}:"
-                        f"kittek_order_number"
-                    ),
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🛒 Kaspi №",
-                    callback_data=(
-                        f"edit_field:"
-                        f"{order_id}:"
-                        f"kaspi_order_number"
-                    ),
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🕐 Время",
-                    callback_data=(
-                        f"edit_field:"
-                        f"{order_id}:delivery_time"
-                    ),
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📝 Комментарий",
-                    callback_data=(
-                        f"edit_field:"
-                        f"{order_id}:comment"
-                    ),
-                )
-            ],
+            [InlineKeyboardButton(
+                text="👤 Имя клиента",
+                callback_data=f"edit_field:{order_id}:client_name",
+            )],
+            [InlineKeyboardButton(
+                text="📞 Телефон",
+                callback_data=f"edit_field:{order_id}:client_phone",
+            )],
+            [InlineKeyboardButton(
+                text="📍 Адрес доставки",
+                callback_data=f"edit_field:{order_id}:delivery_address",
+            )],
+            [InlineKeyboardButton(
+                text="📦 Товар",
+                callback_data=f"edit_field:{order_id}:item",
+            )],
+            [InlineKeyboardButton(
+                text="🔢 Kittek №",
+                callback_data=f"edit_field:{order_id}:kittek_order_number",
+            )],
+            [InlineKeyboardButton(
+                text="🛒 Kaspi №",
+                callback_data=f"edit_field:{order_id}:kaspi_order_number",
+            )],
+            [InlineKeyboardButton(
+                text="🕐 Время",
+                callback_data=f"edit_field:{order_id}:delivery_time",
+            )],
+            [InlineKeyboardButton(
+                text="📝 Комментарий",
+                callback_data=f"edit_field:{order_id}:comment",
+            )],
         ]
     )
 
     await callback.message.answer(
-        f"✏️ РЕДАКТИРОВАНИЕ "
-        f"ЗАКАЗА №{order_id}\n\n"
-
+        f"✏️ РЕДАКТИРОВАНИЕ ЗАКАЗА №{order_id}\n\n"
         f"🔢 Kittek №: "
         f"{optional_number(order['kittek_order_number'])}\n"
-
         f"🛒 Kaspi №: "
         f"{optional_number(order['kaspi_order_number'])}\n\n"
-
-        f"👤 "
-        f"{order['client_name']}\n"
-
-        f"📞 "
-        f"{order['client_phone']}\n"
-
-        f"📍 "
-        f"{order['delivery_address']}\n"
-
-        f"📦 "
-        f"{order['item']}\n"
-
-        f"🕐 "
-        f"{order['delivery_time']}\n"
-
-        f"📝 "
-        f"{order['comment']}\n\n"
-
+        f"👤 {order['client_name']}\n"
+        f"📞 {order['client_phone']}\n"
+        f"📍 {order['delivery_address']}\n"
+        f"📦 {order['item']}\n"
+        f"🕐 {order['delivery_time']}\n"
+        f"📝 {order['comment']}\n\n"
         "Что хотите изменить?",
-
         reply_markup=keyboard,
     )
 
     await callback.answer()
+
+
 
 
 @dp.callback_query(
@@ -7400,21 +8484,32 @@ async def edit_order_field(
 
     async with db_pool.acquire() as conn:
 
-        valid = await conn.fetchval(
+        order = await conn.fetchrow(
             """
-            SELECT EXISTS(
-                SELECT 1
+            SELECT
+                status,
+                created_by_telegram_id
 
-                FROM orders
+            FROM orders
 
-                WHERE id = $1
-                  AND store_id = $2
-                  AND status = 'new'
-            )
+            WHERE id = $1
+              AND store_id = $2
             """,
             order_id,
             membership["store_id"],
         )
+
+    valid = (
+        order
+        and order["status"] in (
+            "new",
+            "postponed",
+        )
+        and (
+            order["created_by_telegram_id"] == callback.from_user.id
+            or membership["member_role"] == "owner"
+        )
+    )
 
     if not valid:
 
@@ -7448,13 +8543,13 @@ async def edit_order_field(
 
     await callback.message.answer(
         f"✏️ Заказ №{order_id}\n\n"
-
-        f"Введите новое "
-        f"{field_names[field]}:"
+        f"Введите новое {field_names[field]}:"
         f"{extra}"
     )
 
     await callback.answer()
+
+
 
 
 @dp.message(
@@ -7519,16 +8614,13 @@ async def save_order_edit(
 
             value = None
 
-    else:
+    elif not raw_value:
 
-        if not raw_value:
+        await message.answer(
+            "❌ Значение не может быть пустым."
+        )
 
-            await message.answer(
-                "❌ Значение "
-                "не может быть пустым."
-            )
-
-            return
+        return
 
     membership = await get_store_membership(
         message.from_user.id
@@ -7548,33 +8640,64 @@ async def save_order_edit(
 
         async with conn.transaction():
 
-            order = await conn.fetchrow(
-                f"""
-                UPDATE orders
+            current = await conn.fetchrow(
+                """
+                SELECT
+                    status,
+                    created_by_telegram_id
 
-                SET
-                    {field} = $1,
-                    updated_at = NOW()
+                FROM orders
 
-                WHERE id = $2
-                  AND store_id = $3
-                  AND status = 'new'
-
-                RETURNING
-                    id,
-                    store_id
+                WHERE id = $1
+                  AND store_id = $2
                 """,
-                value,
                 order_id,
                 membership["store_id"],
             )
 
-            if order:
+            allowed = (
+                current
+                and current["status"] in (
+                    "new",
+                    "postponed",
+                )
+                and (
+                    current["created_by_telegram_id"] == message.from_user.id
+                    or membership["member_role"] == "owner"
+                )
+            )
+
+            if not allowed:
+
+                order = None
+
+            else:
+
+                order = await conn.fetchrow(
+                    f"""
+                    UPDATE orders
+
+                    SET
+                        {field} = $1,
+                        updated_at = NOW()
+
+                    WHERE id = $2
+                      AND store_id = $3
+
+                    RETURNING
+                        id,
+                        store_id,
+                        status
+                    """,
+                    value,
+                    order_id,
+                    membership["store_id"],
+                )
 
                 await add_history(
                     conn,
                     order_id,
-                    "new",
+                    order["status"],
                     "store",
                     message.from_user.id,
                     f"Изменено поле: {field}",
@@ -7585,17 +8708,16 @@ async def save_order_edit(
     if not order:
 
         await message.answer(
-            "❌ Заказ уже назначен курьеру. "
-            "Редактирование заблокировано."
+            "❌ Этот заказ уже нельзя редактировать."
         )
 
         return
 
     await message.answer(
         f"✅ Заказ №{order_id} обновлён.",
-
         reply_markup=store_keyboard,
     )
+
 
 
 # =========================================================
