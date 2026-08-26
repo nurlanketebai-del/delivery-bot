@@ -782,6 +782,14 @@ async def init_db():
             """
         )
 
+        await conn.execute(
+            """
+            ALTER TABLE store_report_settings
+            ADD COLUMN IF NOT EXISTS
+            preparation_topic_id BIGINT
+            """
+        )
+
         # =================================================
         # МИГРАЦИИ
         # =================================================
@@ -1779,8 +1787,14 @@ async def send_order_to_admin(
 
 
 
-async def publish_new_order(order_id: int):
-    order = await get_order_full(order_id)
+
+async def publish_new_order(
+    order_id: int
+):
+
+    order = await get_order_full(
+        order_id
+    )
 
     if not order:
         return
@@ -1790,7 +1804,10 @@ async def publish_new_order(order_id: int):
         "orders",
         build_order_text(
             order,
-            title=f"🆕 НОВЫЙ ЗАКАЗ №{order_id}",
+            title=(
+                f"🆕 НОВЫЙ ЗАКАЗ "
+                f"№{order_id}"
+            ),
         ),
     )
 
@@ -1799,7 +1816,14 @@ async def publish_new_order(order_id: int):
         store_id=order["store_id"],
     )
 
-    await send_order_to_admin(order_id)
+    await send_order_to_preparation_topic(
+        order_id
+    )
+
+    await send_order_to_admin(
+        order_id
+    )
+
 
 
 async def create_scheduled_order_now(scheduled_order_id: int):
@@ -2000,6 +2024,7 @@ async def send_main_menu(
 # TELEGRAM-ГРУППЫ МАГАЗИНОВ
 # =========================================================
 
+
 async def get_store_report_settings(
     store_id: int
 ):
@@ -2012,7 +2037,8 @@ async def get_store_report_settings(
                 store_id,
                 group_chat_id,
                 new_orders_topic_id,
-                status_topic_id
+                status_topic_id,
+                preparation_topic_id
 
             FROM store_report_settings
 
@@ -2020,6 +2046,7 @@ async def get_store_report_settings(
             """,
             store_id,
         )
+
 
 
 async def send_store_topic_text(
@@ -2157,6 +2184,7 @@ def status_history_line(
 
 
 
+
 async def build_store_status_timeline(
     order_id: int,
 ):
@@ -2205,6 +2233,7 @@ async def build_store_status_timeline(
         )
 
     lines = []
+    seen_lines = set()
 
     for row in history:
 
@@ -2214,13 +2243,36 @@ async def build_store_status_timeline(
             order,
         )
 
-        if (
+        if not line:
+            continue
+
+        # Duplicate protection is based on the status text itself,
+        # while the displayed time comes from the actual history row.
+        if line in seen_lines:
+            continue
+
+        seen_lines.add(
             line
-            and line not in lines
-        ):
-            lines.append(
-                line
+        )
+
+        created_at = row[
+            "created_at"
+        ]
+
+        if created_at:
+
+            local_time = created_at.astimezone(
+                LOCAL_TZ
             )
+
+            line = (
+                f"{line} — "
+                f"{local_time.strftime('%H:%M')}"
+            )
+
+        lines.append(
+            line
+        )
 
     if not lines:
         return order, None
@@ -2238,6 +2290,7 @@ async def build_store_status_timeline(
     )
 
     return order, text
+
 
 
 async def update_store_status_message(
@@ -2501,6 +2554,167 @@ async def send_store_topic_document(
 # НОВОЕ — ПОЛУЧЕНИЕ ДОКУМЕНТОВ ЗАКАЗА ИЗ БАЗЫ
 # =========================================================
 
+
+# =========================================================
+# ТРЕТЬЯ ТЕМА — ПОДГОТОВКА / СКЛАД
+# =========================================================
+
+def build_preparation_order_text(
+    order,
+):
+
+    item_text = (
+        order["item"]
+        or "Не указано"
+    )
+
+    return (
+        "🖨 ПОДГОТОВКА ЗАКАЗА\n\n"
+        f"🔢 Kittek №: "
+        f"{optional_number(order['kittek_order_number'])}\n\n"
+        f"📦 Товары:\n"
+        f"{item_text}"
+    )
+
+
+async def send_store_preparation_text(
+    store_id: int,
+    text: str,
+):
+
+    settings = await get_store_report_settings(
+        store_id
+    )
+
+    if not settings:
+        return
+
+    chat_id = settings[
+        "group_chat_id"
+    ]
+
+    topic_id = settings[
+        "preparation_topic_id"
+    ]
+
+    if (
+        not chat_id
+        or not topic_id
+    ):
+        return
+
+    try:
+
+        await bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=topic_id,
+            text=text,
+        )
+
+    except Exception as error:
+
+        print(
+            "STORE PREPARATION MESSAGE ERROR:",
+            store_id,
+            error,
+        )
+
+
+async def send_store_preparation_document(
+    store_id: int,
+    file_id: str,
+    caption: str,
+):
+
+    settings = await get_store_report_settings(
+        store_id
+    )
+
+    if not settings:
+        return
+
+    chat_id = settings[
+        "group_chat_id"
+    ]
+
+    topic_id = settings[
+        "preparation_topic_id"
+    ]
+
+    if (
+        not chat_id
+        or not topic_id
+    ):
+        return
+
+    try:
+
+        await bot.send_document(
+            chat_id=chat_id,
+            message_thread_id=topic_id,
+            document=file_id,
+            caption=caption,
+        )
+
+    except Exception as error:
+
+        print(
+            "STORE PREPARATION DOCUMENT ERROR:",
+            store_id,
+            error,
+        )
+
+
+async def send_order_to_preparation_topic(
+    order_id: int,
+):
+
+    order = await get_order_full(
+        order_id
+    )
+
+    if not order:
+        return
+
+    await send_store_preparation_text(
+        order["store_id"],
+        build_preparation_order_text(
+            order
+        ),
+    )
+
+    documents = await get_order_documents(
+        order_id
+    )
+
+    if not documents:
+        return
+
+    total = len(
+        documents
+    )
+
+    for index, document in enumerate(
+        documents,
+        start=1,
+    ):
+
+        file_name = (
+            document["file_name"]
+            or "Документ"
+        )
+
+        await send_store_preparation_document(
+            store_id=order["store_id"],
+            file_id=document["file_id"],
+            caption=(
+                f"🔢 Kittek №: "
+                f"{optional_number(order['kittek_order_number'])}\n"
+                f"📎 Документ {index}/{total}\n"
+                f"📄 {file_name}"
+            ),
+        )
+
 async def get_order_documents(
     order_id: int
 ):
@@ -2615,6 +2829,7 @@ async def build_status_report(
 
 
 
+
 def courier_order_keyboard(
     order_id: int,
     status: str,
@@ -2632,9 +2847,11 @@ def courier_order_keyboard(
             f"accept_order:{order_id}",
         ),
         "accepted": (
-            "📸🎥 Отчёт при получении",
-            f"pickup_photo:{order_id}",
+            "📦 Товар забран",
+            f"picked_up:{order_id}",
         ),
+        # Legacy compatibility:
+        # old orders that already had pickup_photo can still continue.
         "pickup_photo": (
             "📦 Товар забран",
             f"picked_up:{order_id}",
@@ -2739,6 +2956,7 @@ def courier_order_keyboard(
     return InlineKeyboardMarkup(
         inline_keyboard=buttons
     )
+
 
 
 
@@ -3383,7 +3601,9 @@ async def bind_orders_topic(
                 """
                 UPDATE store_report_settings
 
-                SET status_topic_id = NULL
+                SET
+                    status_topic_id = NULL,
+                    preparation_topic_id = NULL
 
                 WHERE store_id = $1
                 """,
@@ -3400,6 +3620,164 @@ async def bind_orders_topic(
         "будут приходить сюда."
     )
 
+
+
+
+@dp.message(
+    Command("bindprep")
+)
+async def bind_preparation_topic(
+    message: Message
+):
+
+    if message.chat.type not in {
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    }:
+
+        await message.answer(
+            "❌ Команду /bindprep "
+            "нужно отправить "
+            "в группе магазина."
+        )
+
+        return
+
+    if message.sender_chat is not None:
+
+        await message.answer(
+            "❌ Вы отправляете команду анонимно.\n\n"
+            "Отключите анонимность администратора."
+        )
+
+        return
+
+    if not message.message_thread_id:
+
+        await message.answer(
+            "❌ Откройте тему подготовки/склада "
+            "и отправьте /bindprep внутри неё."
+        )
+
+        return
+
+    membership = await get_store_membership(
+        message.from_user.id
+    )
+
+    if not membership:
+
+        await message.answer(
+            "❌ Ваш аккаунт "
+            "не привязан к магазину."
+        )
+
+        return
+
+    if membership[
+        "status"
+    ] != "approved":
+
+        await message.answer(
+            "❌ Магазин ещё не одобрен."
+        )
+
+        return
+
+    if membership[
+        "member_role"
+    ] != "owner":
+
+        await message.answer(
+            "❌ Привязать тему "
+            "может только владелец."
+        )
+
+        return
+
+    async with db_pool.acquire() as conn:
+
+        settings = await conn.fetchrow(
+            """
+            SELECT
+                group_chat_id,
+                new_orders_topic_id,
+                status_topic_id
+
+            FROM store_report_settings
+
+            WHERE store_id = $1
+            """,
+            membership["store_id"],
+        )
+
+        if not settings:
+
+            await message.answer(
+                "❌ Сначала выполните "
+                "/bindorders "
+                "в теме новых заказов."
+            )
+
+            return
+
+        if (
+            settings["group_chat_id"]
+            != message.chat.id
+        ):
+
+            await message.answer(
+                "❌ Эта тема находится "
+                "в другой группе.\n\n"
+                "Все темы должны быть "
+                "в одной группе магазина."
+            )
+
+            return
+
+        occupied_topics = {
+            settings[
+                "new_orders_topic_id"
+            ],
+            settings[
+                "status_topic_id"
+            ],
+        }
+
+        if (
+            message.message_thread_id
+            in occupied_topics
+        ):
+
+            await message.answer(
+                "❌ Для подготовки/склада "
+                "нужна отдельная третья тема."
+            )
+
+            return
+
+        await conn.execute(
+            """
+            UPDATE store_report_settings
+
+            SET
+                preparation_topic_id = $1,
+                updated_at = NOW()
+
+            WHERE store_id = $2
+            """,
+            message.message_thread_id,
+            membership["store_id"],
+        )
+
+    await message.answer(
+        "✅ ТЕМА ПОДГОТОВКИ ПРИВЯЗАНА!\n\n"
+        f"🏪 {membership['store_name']}\n\n"
+        "Теперь сюда будут приходить:\n"
+        "🔢 Kittek №\n"
+        "📦 список товаров\n"
+        "📎 прикреплённые документы."
+    )
 
 @dp.message(
     Command("bindstatus")
@@ -8049,6 +8427,7 @@ async def accept_order(
 # =========================================================
 
 
+
 @dp.callback_query(
     F.data.startswith(
         "pickup_photo:"
@@ -8076,73 +8455,20 @@ async def pickup_photo_request(
 
         return
 
-    async with db_pool.acquire() as conn:
+    await state.clear()
 
-        valid = await conn.fetchval(
-            """
-            SELECT EXISTS(
-                SELECT 1
-
-                FROM orders
-
-                WHERE id = $1
-                  AND courier_id = $2
-                  AND status = 'accepted'
-            )
-            """,
-            order_id,
-            courier_id,
-        )
-
-    if not valid:
-
-        await callback.answer(
-            "Заказ недоступен.",
-            show_alert=True,
-        )
-
-        return
-
-    await state.update_data(
+    await update_courier_order_card(
+        chat_id=callback.message.chat.id,
+        message_id=callback.message.message_id,
         order_id=order_id,
-        report_count=0,
-        courier_card_chat_id=(
-            callback.message.chat.id
-        ),
-        courier_card_message_id=(
-            callback.message.message_id
-        ),
     )
 
-    await state.set_state(
-        CourierPhoto.pickup_photo
+    await callback.answer(
+        "Фото/видео при получении больше не требуется. "
+        "Нажмите «📦 Товар забран».",
+        show_alert=True,
     )
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Готово",
-                    callback_data=(
-                        f"pickup_report_done:"
-                        f"{order_id}"
-                    ),
-                )
-            ]
-        ]
-    )
-
-    await callback.message.answer(
-        f"📸🎥 ОТЧЁТ ПРИ ПОЛУЧЕНИИ\n\n"
-        f"Заказ №{order_id}\n\n"
-        "Отправьте фото и/или видео.\n"
-        "Можно отправить несколько файлов подряд.\n\n"
-        "Когда закончите — нажмите "
-        "«✅ Готово».",
-        reply_markup=keyboard,
-    )
-
-    await callback.answer()
 
 
 
@@ -8435,6 +8761,7 @@ async def pickup_photo_wrong(
 # ТОВАР ЗАБРАН
 # =========================================================
 
+
 @dp.callback_query(
     F.data.startswith(
         "picked_up:"
@@ -8469,7 +8796,10 @@ async def picked_up(
 
                 WHERE id = $1
                   AND courier_id = $2
-                  AND status = 'pickup_photo'
+                  AND status IN (
+                        'accepted',
+                        'pickup_photo'
+                  )
 
                 RETURNING
                     id,
@@ -8505,16 +8835,14 @@ async def picked_up(
         order_id=order_id,
     )
 
-    await callback.answer(
-        "📦 Товар забран."
-    )
-
-
     await update_store_status_message(
         order_id
     )
 
-    await callback.answer()
+    await callback.answer(
+        "📦 Товар забран."
+    )
+
 
 
 
@@ -11776,6 +12104,112 @@ async def cancel_admin_action(
 # ОЧЕРЕДИ КУРЬЕРОВ — АДМИН
 # =========================================================
 
+
+async def build_admin_queues_overview():
+
+    async with db_pool.acquire() as conn:
+
+        couriers = await conn.fetch(
+            """
+            SELECT
+                c.id,
+                c.full_name,
+                c.vehicle,
+                COUNT(o.id) FILTER (
+                    WHERE o.status = ANY($1::text[])
+                ) AS active_count
+
+            FROM couriers c
+
+            LEFT JOIN orders o
+                ON o.courier_id = c.id
+
+            WHERE c.status = 'approved'
+
+            GROUP BY
+                c.id,
+                c.full_name,
+                c.vehicle
+
+            ORDER BY
+                active_count ASC,
+                c.full_name
+            """,
+            list(QUEUE_ACTIVE_STATUSES),
+        )
+
+    if not couriers:
+
+        return (
+            "🧾 ОЧЕРЕДИ КУРЬЕРОВ\n\n"
+            "🚚 Одобренных курьеров нет.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[]
+            ),
+        )
+
+    buttons = []
+
+    for courier in couriers:
+
+        buttons.append([
+            InlineKeyboardButton(
+                text=(
+                    f"🚚 {courier['full_name']} — "
+                    f"{courier['active_count']} заказов"
+                ),
+                callback_data=(
+                    f"queue_courier:"
+                    f"{courier['id']}"
+                ),
+            )
+        ])
+
+    return (
+        "🧾 ОЧЕРЕДИ КУРЬЕРОВ\n\n"
+        "Выберите курьера.\n"
+        "Показана текущая нагрузка.",
+        InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        ),
+    )
+
+
+async def edit_admin_queue_message(
+    callback: CallbackQuery,
+    text: str,
+    keyboard,
+):
+
+    try:
+
+        await callback.message.edit_text(
+            text,
+            reply_markup=keyboard,
+        )
+
+        return True
+
+    except Exception as error:
+
+        error_text = str(
+            error
+        ).lower()
+
+        if (
+            "message is not modified"
+            in error_text
+        ):
+            return True
+
+        print(
+            "ADMIN QUEUE EDIT ERROR:",
+            error,
+        )
+
+        return False
+
+
 async def build_courier_queue_view(
     courier_id: int,
 ):
@@ -11823,7 +12257,9 @@ async def build_courier_queue_view(
             WHERE o.courier_id = $1
               AND o.status = ANY($2::text[])
 
-            ORDER BY o.queue_position, o.id
+            ORDER BY
+                o.queue_position,
+                o.id
             """,
             courier_id,
             list(QUEUE_ACTIVE_STATUSES),
@@ -11838,7 +12274,10 @@ async def build_courier_queue_view(
     buttons = []
 
     if not orders:
-        text += "📦 Активных заказов нет."
+
+        text += (
+            "📦 Активных заказов нет."
+        )
 
     for order in orders:
 
@@ -11882,14 +12321,21 @@ async def build_courier_queue_view(
             ),
         ])
 
-    keyboard = None
-
-    if buttons:
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=buttons
+    buttons.append([
+        InlineKeyboardButton(
+            text="↩️ Назад к курьерам",
+            callback_data="queue_back",
         )
+    ])
 
-    return text, keyboard
+    return (
+        text,
+        InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        ),
+    )
+
+
 
 
 @dp.message(
@@ -11904,70 +12350,14 @@ async def admin_queues(
     ):
         return
 
-    async with db_pool.acquire() as conn:
-
-        couriers = await conn.fetch(
-            """
-            SELECT
-                c.id,
-                c.full_name,
-                c.vehicle,
-                COUNT(o.id) FILTER (
-                    WHERE o.status = ANY($1::text[])
-                ) AS active_count
-
-            FROM couriers c
-
-            LEFT JOIN orders o
-                ON o.courier_id = c.id
-
-            WHERE c.status = 'approved'
-
-            GROUP BY
-                c.id,
-                c.full_name,
-                c.vehicle
-
-            ORDER BY
-                active_count ASC,
-                c.full_name
-            """,
-            list(QUEUE_ACTIVE_STATUSES),
-        )
-
-    if not couriers:
-
-        await message.answer(
-            "🚚 Одобренных курьеров нет."
-        )
-
-        return
-
-    buttons = []
-
-    for courier in couriers:
-
-        buttons.append([
-            InlineKeyboardButton(
-                text=(
-                    f"🚚 {courier['full_name']} — "
-                    f"{courier['active_count']} заказов"
-                ),
-                callback_data=(
-                    f"queue_courier:"
-                    f"{courier['id']}"
-                ),
-            )
-        ])
+    text, keyboard = await build_admin_queues_overview()
 
     await message.answer(
-        "🧾 ОЧЕРЕДИ КУРЬЕРОВ\n\n"
-        "Выберите курьера.\n"
-        "В скобках показана текущая нагрузка.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        ),
+        text,
+        reply_markup=keyboard,
     )
+
+
 
 
 @dp.callback_query(
@@ -11999,12 +12389,25 @@ async def admin_queue_courier(
 
         return
 
-    await callback.message.answer(
+    edited = await edit_admin_queue_message(
+        callback,
         text,
-        reply_markup=keyboard,
+        keyboard,
     )
 
+    if not edited:
+
+        await callback.answer(
+            "Не удалось обновить окно очереди. "
+            "Откройте «🧾 Очереди» заново.",
+            show_alert=True,
+        )
+
+        return
+
     await callback.answer()
+
+
 
 
 @dp.callback_query(
@@ -12036,18 +12439,30 @@ async def admin_queue_move(
 
             rows = await conn.fetch(
                 """
-                SELECT id, status
+                SELECT
+                    id,
+                    status
+
                 FROM orders
+
                 WHERE courier_id = $1
                   AND status = ANY($2::text[])
-                ORDER BY queue_position, id
+
+                ORDER BY
+                    queue_position,
+                    id
+
                 FOR UPDATE
                 """,
                 courier_id,
                 list(QUEUE_ACTIVE_STATUSES),
             )
 
-            ids = [row["id"] for row in rows]
+            ids = [
+                row["id"]
+                for row in rows
+            ]
+
             statuses = {
                 row["id"]: row["status"]
                 for row in rows
@@ -12063,29 +12478,44 @@ async def admin_queue_move(
 
                 return
 
-            old_index = ids.index(order_id)
+            old_index = ids.index(
+                order_id
+            )
+
             new_index = old_index
 
             if direction == "top":
+
                 new_index = 0
 
             elif direction == "up":
+
                 new_index = max(
                     0,
                     old_index - 1,
                 )
 
             elif direction == "down":
+
                 new_index = min(
                     len(ids) - 1,
                     old_index + 1,
                 )
 
             elif direction == "bottom":
-                new_index = len(ids) - 1
 
-            ids.pop(old_index)
-            ids.insert(new_index, order_id)
+                new_index = (
+                    len(ids) - 1
+                )
+
+            ids.pop(
+                old_index
+            )
+
+            ids.insert(
+                new_index,
+                order_id,
+            )
 
             for position, current_id in enumerate(
                 ids,
@@ -12095,9 +12525,11 @@ async def admin_queue_move(
                 await conn.execute(
                     """
                     UPDATE orders
+
                     SET
                         queue_position = $1,
                         updated_at = NOW()
+
                     WHERE id = $2
                     """,
                     position,
@@ -12107,7 +12539,10 @@ async def admin_queue_move(
             await add_history(
                 conn,
                 order_id,
-                statuses.get(order_id, "assigned"),
+                statuses.get(
+                    order_id,
+                    "assigned",
+                ),
                 "admin",
                 callback.from_user.id,
                 (
@@ -12116,31 +12551,66 @@ async def admin_queue_move(
                 ),
             )
 
-    await notify_courier(
-        courier_id,
-        "🧾 Администратор изменил порядок вашей очереди. "
-        "Откройте «📦 Мои доставки», чтобы увидеть новый порядок.",
-    )
-
+    # Queue management itself does not send extra
+    # messages into the administrator's chat.
     text, keyboard = await build_courier_queue_view(
         courier_id
     )
 
-    try:
-        await callback.message.edit_text(
-            text,
-            reply_markup=keyboard,
+    edited = await edit_admin_queue_message(
+        callback,
+        text,
+        keyboard,
+    )
+
+    if not edited:
+
+        await callback.answer(
+            "Очередь изменена, но окно не обновилось. "
+            "Откройте «🧾 Очереди» заново.",
+            show_alert=True,
         )
-    except Exception:
-        await callback.message.answer(
-            text,
-            reply_markup=keyboard,
-        )
+
+        return
 
     await callback.answer(
         "Очередь обновлена."
     )
 
+
+
+
+@dp.callback_query(
+    F.data == "queue_back"
+)
+async def admin_queue_back(
+    callback: CallbackQuery
+):
+
+    if await deny_admin_callback(
+        callback
+    ):
+        return
+
+    text, keyboard = await build_admin_queues_overview()
+
+    edited = await edit_admin_queue_message(
+        callback,
+        text,
+        keyboard,
+    )
+
+    if not edited:
+
+        await callback.answer(
+            "Не удалось вернуться к списку. "
+            "Откройте «🧾 Очереди» заново.",
+            show_alert=True,
+        )
+
+        return
+
+    await callback.answer()
 
 # =========================================================
 # ПЕРЕНОС / ПЕРЕВЫПУСК СУЩЕСТВУЮЩЕГО ЗАКАЗА
