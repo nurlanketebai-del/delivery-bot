@@ -140,6 +140,14 @@ class OrderCreationEdit(StatesGroup):
 class ScheduledOrderEdit(StatesGroup):
     value = State()
 
+class OrderDocumentEdit(StatesGroup):
+    upload = State()
+
+
+class ScheduledOrderDocumentEdit(StatesGroup):
+    upload = State()
+
+
 class OrderEdit(StatesGroup):
     value = State()
 
@@ -7965,6 +7973,10 @@ async def edit_scheduled_order_menu(
                 text="🗓 Время публикации",
                 callback_data=f"scheduled_edit:{scheduled_id}:scheduled_for",
             )],
+            [InlineKeyboardButton(
+                text="📎 Документы",
+                callback_data=f"scheduled_docs:{scheduled_id}",
+            )],
         ]
     )
 
@@ -8298,6 +8310,389 @@ async def save_scheduled_order_edit(
         reply_markup=store_keyboard,
     )
 
+
+# =========================================================
+# ДОКУМЕНТЫ ПРИ РЕДАКТИРОВАНИИ ЗАКАЗОВ
+# =========================================================
+
+def order_documents_manage_keyboard(order_id: int, documents):
+    rows = [
+        [InlineKeyboardButton(
+            text="➕ Добавить документ",
+            callback_data=f"order_doc_add:{order_id}",
+        )]
+    ]
+
+    for document in documents:
+        name = document["file_name"] or f"Документ #{document['id']}"
+        short_name = name if len(name) <= 34 else name[:31] + "..."
+        rows.append([
+            InlineKeyboardButton(
+                text=f"🗑 {short_name}",
+                callback_data=f"order_doc_delete:{order_id}:{document['id']}",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            text="↩️ Назад к редактированию",
+            callback_data=f"edit_order:{order_id}",
+        )
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def scheduled_documents_manage_keyboard(scheduled_id: int, documents):
+    rows = [
+        [InlineKeyboardButton(
+            text="➕ Добавить документ",
+            callback_data=f"scheduled_doc_add:{scheduled_id}",
+        )]
+    ]
+
+    for document in documents:
+        name = document["file_name"] or f"Документ #{document['id']}"
+        short_name = name if len(name) <= 34 else name[:31] + "..."
+        rows.append([
+            InlineKeyboardButton(
+                text=f"🗑 {short_name}",
+                callback_data=f"scheduled_doc_delete:{scheduled_id}:{document['id']}",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            text="↩️ Назад к редактированию",
+            callback_data=f"edit_scheduled:{scheduled_id}",
+        )
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def get_scheduled_order_documents(scheduled_id: int):
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT id, file_id, file_name, mime_type, file_size, created_at
+            FROM scheduled_order_documents
+            WHERE scheduled_order_id = $1
+            ORDER BY id ASC
+            """,
+            scheduled_id,
+        )
+
+
+async def can_edit_normal_order_document(user_id: int, order_id: int):
+    membership = await get_store_membership(user_id)
+    if not membership:
+        return None, None
+
+    async with db_pool.acquire() as conn:
+        order = await conn.fetchrow(
+            """
+            SELECT *
+            FROM orders
+            WHERE id = $1 AND store_id = $2
+            """,
+            order_id,
+            membership["store_id"],
+        )
+
+    allowed = (
+        order
+        and order["status"] in ("new", "postponed")
+        and (
+            order["created_by_telegram_id"] == user_id
+            or membership["member_role"] == "owner"
+        )
+    )
+    return membership, order if allowed else None
+
+
+async def can_edit_scheduled_order_document(user_id: int, scheduled_id: int):
+    membership = await get_store_membership(user_id)
+    if not membership:
+        return None, None
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT *
+            FROM scheduled_orders
+            WHERE id = $1
+              AND store_id = $2
+              AND status = 'scheduled'
+            """,
+            scheduled_id,
+            membership["store_id"],
+        )
+
+    allowed = (
+        row
+        and (
+            row["created_by_telegram_id"] == user_id
+            or membership["member_role"] == "owner"
+        )
+    )
+    return membership, row if allowed else None
+
+
+@dp.callback_query(F.data.startswith("order_docs:"))
+async def order_documents_menu(callback: CallbackQuery):
+    order_id = int(callback.data.split(":")[1])
+    membership, order = await can_edit_normal_order_document(
+        callback.from_user.id, order_id
+    )
+
+    if not order:
+        await callback.answer(
+            "❌ Документы этого заказа сейчас нельзя редактировать.",
+            show_alert=True,
+        )
+        return
+
+    documents = await get_order_documents(order_id)
+    names = "\n".join(
+        f"• {d['file_name'] or 'Документ'}" for d in documents
+    ) or "Документов пока нет."
+
+    await callback.message.answer(
+        f"📎 ДОКУМЕНТЫ ЗАКАЗА №{order_id}\n\n"
+        f"{names}\n\n"
+        "Можно добавить новый документ или удалить ненужный.",
+        reply_markup=order_documents_manage_keyboard(order_id, documents),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("order_doc_add:"))
+async def order_document_add_start(callback: CallbackQuery, state: FSMContext):
+    order_id = int(callback.data.split(":")[1])
+    _, order = await can_edit_normal_order_document(callback.from_user.id, order_id)
+    if not order:
+        await callback.answer("❌ Заказ уже нельзя редактировать.", show_alert=True)
+        return
+
+    await state.update_data(order_document_edit_id=order_id)
+    await state.set_state(OrderDocumentEdit.upload)
+    await callback.message.answer(
+        f"📎 Заказ №{order_id}\n\n"
+        "Отправьте новый файл как документ.\n"
+        "После сохранения он будет добавлен к заказу и отправлен в нужные темы.",
+        reply_markup=creation_back_keyboard,
+    )
+    await callback.answer()
+
+
+@dp.message(OrderDocumentEdit.upload, F.document)
+async def order_document_add_save(message: Message, state: FSMContext):
+    data = await state.get_data()
+    order_id = data.get("order_document_edit_id")
+    membership, order = await can_edit_normal_order_document(message.from_user.id, order_id)
+    if not order:
+        await state.clear()
+        await message.answer("❌ Заказ уже нельзя редактировать.", reply_markup=store_keyboard)
+        return
+
+    doc = message.document
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO order_documents (order_id, file_id, file_name, mime_type, file_size)
+                VALUES ($1,$2,$3,$4,$5)
+                """,
+                order_id, doc.file_id, doc.file_name, doc.mime_type, doc.file_size,
+            )
+            await add_history(
+                conn, order_id, order["status"], "store", message.from_user.id,
+                f"Добавлен документ: {doc.file_name or 'Документ'}",
+            )
+
+    caption = f"📎 Заказ №{order_id}\n📄 {doc.file_name or 'Документ'}"
+    await send_store_topic_document(
+        store_id=order["store_id"], file_id=doc.file_id, caption=caption
+    )
+    await send_store_preparation_document(
+        store_id=order["store_id"],
+        file_id=doc.file_id,
+        caption=(
+            f"🔢 Kittek №: {optional_number(order['kittek_order_number'])}\n"
+            f"📎 Добавлен документ\n📄 {doc.file_name or 'Документ'}"
+        ),
+    )
+    if ADMIN_ID:
+        try:
+            await bot.send_document(
+                chat_id=ADMIN_ID,
+                document=doc.file_id,
+                caption=caption,
+            )
+        except Exception as error:
+            print("ADMIN ADDED DOCUMENT ERROR:", order_id, error)
+
+    await state.clear()
+    await message.answer(
+        f"✅ Документ добавлен к заказу №{order_id}.",
+        reply_markup=store_keyboard,
+    )
+
+
+@dp.message(OrderDocumentEdit.upload)
+async def order_document_add_wrong(message: Message, state: FSMContext):
+    if message.text == "⬅️ Назад":
+        await state.clear()
+        await message.answer("Добавление документа отменено.", reply_markup=store_keyboard)
+        return
+    await message.answer(
+        "📎 Отправьте файл именно как документ или нажмите «⬅️ Назад».",
+        reply_markup=creation_back_keyboard,
+    )
+
+
+@dp.callback_query(F.data.startswith("order_doc_delete:"))
+async def order_document_delete(callback: CallbackQuery):
+    _, order_id_raw, document_id_raw = callback.data.split(":", 2)
+    order_id = int(order_id_raw)
+    document_id = int(document_id_raw)
+    _, order = await can_edit_normal_order_document(callback.from_user.id, order_id)
+    if not order:
+        await callback.answer("❌ Заказ уже нельзя редактировать.", show_alert=True)
+        return
+
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            deleted = await conn.fetchrow(
+                """
+                DELETE FROM order_documents
+                WHERE id = $1 AND order_id = $2
+                RETURNING file_name
+                """,
+                document_id, order_id,
+            )
+            if deleted:
+                await add_history(
+                    conn, order_id, order["status"], "store", callback.from_user.id,
+                    f"Удалён документ: {deleted['file_name'] or 'Документ'}",
+                )
+
+    if not deleted:
+        await callback.answer("Документ уже удалён.", show_alert=True)
+        return
+
+    await callback.answer("✅ Документ удалён.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("scheduled_docs:"))
+async def scheduled_documents_menu(callback: CallbackQuery):
+    scheduled_id = int(callback.data.split(":")[1])
+    _, row = await can_edit_scheduled_order_document(callback.from_user.id, scheduled_id)
+    if not row:
+        await callback.answer("❌ Отложенный заказ недоступен.", show_alert=True)
+        return
+
+    documents = await get_scheduled_order_documents(scheduled_id)
+    names = "\n".join(
+        f"• {d['file_name'] or 'Документ'}" for d in documents
+    ) or "Документов пока нет."
+    await callback.message.answer(
+        f"📎 ДОКУМЕНТЫ ОТЛОЖЕННОГО ЗАКАЗА №{scheduled_id}\n\n"
+        f"{names}\n\n"
+        "До публикации документы можно добавлять и удалять.",
+        reply_markup=scheduled_documents_manage_keyboard(scheduled_id, documents),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("scheduled_doc_add:"))
+async def scheduled_document_add_start(callback: CallbackQuery, state: FSMContext):
+    scheduled_id = int(callback.data.split(":")[1])
+    _, row = await can_edit_scheduled_order_document(callback.from_user.id, scheduled_id)
+    if not row:
+        await callback.answer("❌ Отложенный заказ недоступен.", show_alert=True)
+        return
+
+    await state.update_data(scheduled_document_edit_id=scheduled_id)
+    await state.set_state(ScheduledOrderDocumentEdit.upload)
+    await callback.message.answer(
+        f"📎 Отложенный заказ №{scheduled_id}\n\n"
+        "Отправьте новый файл как документ.\n"
+        "Сейчас он никуда не публикуется — уйдёт вместе с заказом по расписанию.",
+        reply_markup=creation_back_keyboard,
+    )
+    await callback.answer()
+
+
+@dp.message(ScheduledOrderDocumentEdit.upload, F.document)
+async def scheduled_document_add_save(message: Message, state: FSMContext):
+    data = await state.get_data()
+    scheduled_id = data.get("scheduled_document_edit_id")
+    _, row = await can_edit_scheduled_order_document(message.from_user.id, scheduled_id)
+    if not row:
+        await state.clear()
+        await message.answer("❌ Отложенный заказ уже недоступен.", reply_markup=store_keyboard)
+        return
+
+    doc = message.document
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO scheduled_order_documents
+                (scheduled_order_id, file_id, file_name, mime_type, file_size)
+            VALUES ($1,$2,$3,$4,$5)
+            """,
+            scheduled_id, doc.file_id, doc.file_name, doc.mime_type, doc.file_size,
+        )
+
+    await state.clear()
+    await message.answer(
+        f"✅ Документ добавлен к отложенному заказу №{scheduled_id}.\n"
+        "Он будет опубликован вместе с заказом.",
+        reply_markup=store_keyboard,
+    )
+
+
+@dp.message(ScheduledOrderDocumentEdit.upload)
+async def scheduled_document_add_wrong(message: Message, state: FSMContext):
+    if message.text == "⬅️ Назад":
+        await state.clear()
+        await message.answer("Добавление документа отменено.", reply_markup=store_keyboard)
+        return
+    await message.answer(
+        "📎 Отправьте файл именно как документ или нажмите «⬅️ Назад».",
+        reply_markup=creation_back_keyboard,
+    )
+
+
+@dp.callback_query(F.data.startswith("scheduled_doc_delete:"))
+async def scheduled_document_delete(callback: CallbackQuery):
+    _, scheduled_id_raw, document_id_raw = callback.data.split(":", 2)
+    scheduled_id = int(scheduled_id_raw)
+    document_id = int(document_id_raw)
+    _, row = await can_edit_scheduled_order_document(callback.from_user.id, scheduled_id)
+    if not row:
+        await callback.answer("❌ Отложенный заказ недоступен.", show_alert=True)
+        return
+
+    async with db_pool.acquire() as conn:
+        deleted = await conn.fetchrow(
+            """
+            DELETE FROM scheduled_order_documents
+            WHERE id = $1 AND scheduled_order_id = $2
+            RETURNING file_name
+            """,
+            document_id, scheduled_id,
+        )
+
+    if not deleted:
+        await callback.answer("Документ уже удалён.", show_alert=True)
+        return
+
+    await callback.answer("✅ Документ удалён.", show_alert=True)
+
+
 # =========================================================
 # РЕДАКТИРОВАНИЕ ЗАКАЗА
 # =========================================================
@@ -8406,6 +8801,10 @@ async def edit_order_menu(
             [InlineKeyboardButton(
                 text="📝 Комментарий",
                 callback_data=f"edit_field:{order_id}:comment",
+            )],
+            [InlineKeyboardButton(
+                text="📎 Документы",
+                callback_data=f"order_docs:{order_id}",
             )],
         ]
     )
