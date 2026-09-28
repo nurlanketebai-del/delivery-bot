@@ -1043,6 +1043,19 @@ def price_text(value) -> str:
     )
 
 
+def primary_order_number(order) -> str:
+    """Business-facing order identifier: Kittek first, bot DB id second."""
+    kittek = str(order.get("kittek_order_number") or "").strip() if hasattr(order, "get") else ""
+    return kittek or str(order.get("id") or "—")
+
+
+def next_morning_09_local(now=None):
+    now = now or datetime.now(LOCAL_TZ)
+    local_now = now.astimezone(LOCAL_TZ)
+    tomorrow = local_now.date() + timedelta(days=1)
+    return datetime(tomorrow.year, tomorrow.month, tomorrow.day, 9, 0, tzinfo=LOCAL_TZ)
+
+
 def optional_number(value):
 
     if value is None:
@@ -1855,8 +1868,9 @@ async def publish_new_order(
         build_order_text(
             order,
             title=(
-                f"🆕 НОВЫЙ ЗАКАЗ "
-                f"№{order_id}"
+                f"🆕 НОВЫЙ ЗАКАЗ — Kittek №"
+                f"{optional_number(order['kittek_order_number'])}"
+                f"\n🔧 ID бота: {order_id}"
             ),
         ),
     )
@@ -2360,9 +2374,8 @@ async def build_store_status_timeline(
     creator_display = tg_link(order["created_by"], order["creator_telegram_id"])
 
     text = (
-        f"📦 СТАТУС ЗАКАЗА №{order_id}\n\n"
-        f"🔢 Kittek №: "
-        f"{__import__('html').escape(str(optional_number(order['kittek_order_number'])))}\n"
+        f"📦 СТАТУС ЗАКАЗА — Kittek №{optional_number(order['kittek_order_number'])}\n"
+        f"🔧 ID бота: {order_id}\n\n"
         f"🛒 Kaspi №: "
         f"{__import__('html').escape(str(optional_number(order['kaspi_order_number'])))}\n"
         f"👤 Создал: {creator_display}\n"
@@ -2857,7 +2870,8 @@ async def send_order_documents_to_group(
         )
 
         caption = (
-            f"📎 Заказ №{order_id}\n"
+            f"📎 Kittek №{optional_number(order['kittek_order_number'])}\n"
+            f"🔧 ID бота: {order_id}\n"
             f"Документ {index}/{total}\n"
             f"📄 {file_name}"
         )
@@ -2893,10 +2907,8 @@ async def build_status_report(
     return (
         f"{headline}\n\n"
 
-        f"📦 Заказ №{order_id}\n"
-
-        f"🔢 Kittek №: "
-        f"{optional_number(order['kittek_order_number'])}\n"
+        f"📦 Kittek №: {optional_number(order['kittek_order_number'])}\n"
+        f"🔧 ID бота: {order_id}\n"
 
         f"🛒 Kaspi №: "
         f"{optional_number(order['kaspi_order_number'])}\n\n"
@@ -7881,18 +7893,17 @@ async def store_history(
             order_id,
         )
 
+    order = await get_order_full(order_id)
     text = (
-        f"🕐 ИСТОРИЯ ЗАКАЗА №"
-        f"{order_id}\n\n"
+        f"🕐 ИСТОРИЯ ЗАКАЗА\n"
+        f"🔢 Kittek №: {optional_number(order['kittek_order_number']) if order else '—'}\n"
+        f"🔧 ID бота: {order_id}\n\n"
     )
 
     for row in history:
 
         time_text = (
-            row["created_at"]
-            .strftime(
-                "%d.%m.%Y %H:%M"
-            )
+            row["created_at"].astimezone(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
         )
 
         text += (
@@ -11538,23 +11549,61 @@ async def admin_home(
 
 def stats_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📅 Сегодня",callback_data="stats_today")],
-        [InlineKeyboardButton(text="🗓 Выбрать дату",callback_data="stats_date")],
-        [InlineKeyboardButton(text="📆 Период",callback_data="stats_period")],
+        [InlineKeyboardButton(text="📅 Сегодня", callback_data="stats_today")],
+        [InlineKeyboardButton(text="🗓 Выбрать дату", callback_data="stats_date")],
+        [InlineKeyboardButton(text="📆 Период", callback_data="stats_period")],
     ])
 
+
 async def build_daily_statistics(day):
-    start=datetime(day.year,day.month,day.day,tzinfo=LOCAL_TZ); finish=start+timedelta(days=1)
+    start = datetime(day.year, day.month, day.day, tzinfo=LOCAL_TZ)
+    finish = start + timedelta(days=1)
     async with db_pool.acquire() as conn:
-        summary=await conn.fetchrow("""SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE status='delivered')::int delivered,COUNT(*) FILTER(WHERE status='cancelled')::int cancelled,COUNT(*) FILTER(WHERE status='postponed')::int postponed,COUNT(*) FILTER(WHERE status='problem')::int problems,COUNT(*) FILTER(WHERE status NOT IN('delivered','cancelled'))::int unresolved,COALESCE(SUM(delivery_price) FILTER(WHERE status='delivered'),0) delivered_sum FROM orders WHERE created_at >= $1 AND created_at < $2""",start,finish)
-        couriers=await conn.fetch("""SELECT COALESCE(c.full_name,'Не назначен') name,COUNT(*)::int cnt FROM orders o LEFT JOIN couriers c ON c.id=o.courier_id WHERE o.created_at >= $1 AND o.created_at < $2 GROUP BY COALESCE(c.full_name,'Не назначен') ORDER BY cnt DESC,name""",start,finish)
-        stores=await conn.fetch("""SELECT s.store_name name,COUNT(*)::int cnt FROM orders o JOIN stores s ON s.id=o.store_id WHERE o.created_at >= $1 AND o.created_at < $2 GROUP BY s.store_name ORDER BY cnt DESC,name""",start,finish)
-        events=await conn.fetchrow("""SELECT COUNT(*) FILTER(WHERE status='postponed')::int postponed_events,COUNT(*) FILTER(WHERE status='problem')::int problem_events,COUNT(*) FILTER(WHERE status='cancelled')::int cancelled_events,COUNT(*) FILTER(WHERE status='delivered')::int delivered_events FROM order_status_history WHERE created_at >= $1 AND created_at < $2""",start,finish)
-    text=f"📊 СТАТИСТИКА — {start.strftime('%d.%m.%Y')}\n\n📦 Создано заказов: {summary['total']}\n✅ Доставлено (из созданных): {summary['delivered']}\n❌ Отменено (из созданных): {summary['cancelled']}\n🗓 Сейчас перенесено: {summary['postponed']}\n⏳ Незавершённых: {summary['unresolved']}\n💰 Доставки: {price_text(summary['delivered_sum'])}\n\n📌 События за день:\n✅ Завершений: {events['delivered_events']}\n❌ Отмен: {events['cancelled_events']}\n🗓 Переносов: {events['postponed_events']}\n⚠️ Проблем: {events['problem_events']}"
-    if couriers: text+='\n\n🚚 По курьерам (текущий/итоговый курьер):\n'+'\n'.join(f"• {r['name']} — {r['cnt']}" for r in couriers)
-    if stores: text+='\n\n🏪 По магазинам:\n'+'\n'.join(f"• {r['name']} — {r['cnt']}" for r in stores)
-    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📋 Все заказы за день",callback_data=f"stats_orders:{start.strftime('%Y-%m-%d')}")],[InlineKeyboardButton(text="🔎 Поиск в этом дне",callback_data=f"stats_search:{start.strftime('%Y-%m-%d')}")],[InlineKeyboardButton(text="↩️ Статистика",callback_data="stats_menu")]])
+        created = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE created_at >= $1 AND created_at < $2", start, finish)
+        events = await conn.fetchrow(
+            """SELECT
+                COUNT(DISTINCT order_id) FILTER (WHERE status='delivered')::int AS delivered,
+                COUNT(DISTINCT order_id) FILTER (WHERE status='cancelled')::int AS cancelled,
+                COUNT(*) FILTER (WHERE status='postponed')::int AS postponed_events,
+                COUNT(DISTINCT order_id) FILTER (WHERE status='problem')::int AS problem_events,
+                COALESCE((SELECT SUM(o2.delivery_price) FROM orders o2 WHERE o2.id IN (SELECT DISTINCT h2.order_id FROM order_status_history h2 WHERE h2.status='delivered' AND h2.created_at >= $1 AND h2.created_at < $2)),0) AS delivered_sum
+            FROM order_status_history h JOIN orders o ON o.id=h.order_id
+            WHERE h.created_at >= $1 AND h.created_at < $2""", start, finish)
+        unresolved = await conn.fetchval(
+            """WITH latest AS (
+                SELECT DISTINCT ON (h.order_id) h.order_id,h.status
+                FROM order_status_history h WHERE h.created_at < $1
+                ORDER BY h.order_id,h.created_at DESC,h.id DESC)
+            SELECT COUNT(*) FROM latest l
+            WHERE l.status NOT IN ('delivered','cancelled')
+              AND EXISTS (SELECT 1 FROM orders o WHERE o.id=l.order_id AND o.created_at < $1)""", finish)
+        couriers = await conn.fetch(
+            """SELECT COALESCE(c.full_name,'Не назначен') AS name,COUNT(DISTINCT h.order_id)::int AS cnt
+            FROM order_status_history h JOIN orders o ON o.id=h.order_id LEFT JOIN couriers c ON c.id=o.courier_id
+            WHERE h.status='delivered' AND h.created_at >= $1 AND h.created_at < $2
+            GROUP BY COALESCE(c.full_name,'Не назначен') ORDER BY cnt DESC,name""", start, finish)
+        stores = await conn.fetch(
+            """SELECT s.store_name AS name,COUNT(DISTINCT h.order_id)::int AS cnt
+            FROM order_status_history h JOIN orders o ON o.id=h.order_id JOIN stores s ON s.id=o.store_id
+            WHERE h.status='delivered' AND h.created_at >= $1 AND h.created_at < $2
+            GROUP BY s.store_name ORDER BY cnt DESC,name""", start, finish)
+    text=(f"📊 СТАТИСТИКА — {start.strftime('%d.%m.%Y')}\n\n"
+          f"📦 Создано заказов: {int(created or 0)}\n"
+          f"✅ Доставлено: {int(events['delivered'] or 0)}\n"
+          f"❌ Отменено: {int(events['cancelled'] or 0)}\n"
+          f"🗓 Переносов: {int(events['postponed_events'] or 0)}\n"
+          f"⚠️ Заказов с проблемой: {int(events['problem_events'] or 0)}\n"
+          f"⏳ Незавершённых на конец дня: {int(unresolved or 0)}\n"
+          f"💰 Сумма доставок: {price_text(events['delivered_sum'])}")
+    if couriers: text += "\n\n🚚 Доставлено по курьерам:\n" + "\n".join(f"• {r['name']} — {r['cnt']}" for r in couriers)
+    if stores: text += "\n\n🏪 Доставлено по магазинам:\n" + "\n".join(f"• {r['name']} — {r['cnt']}" for r in stores)
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Все заказы за день",callback_data=f"stats_orders:{start.strftime('%Y-%m-%d')}")],
+        [InlineKeyboardButton(text="📋 Отчёт по курьерам",callback_data=f"stats_courier_report:{start.strftime('%Y-%m-%d')}")],
+        [InlineKeyboardButton(text="🔎 Поиск в этом дне",callback_data=f"stats_search:{start.strftime('%Y-%m-%d')}")],
+        [InlineKeyboardButton(text="↩️ Статистика",callback_data="stats_menu")]])
     return text,kb
+
 
 @dp.message(F.text == "📊 Статистика")
 async def admin_statistics(message: Message):
@@ -11589,39 +11638,73 @@ async def stats_date_input(message:Message,state:FSMContext):
         if data.get('stats_mode')=='period':
             a,b=[x.strip() for x in raw.split('-',1)]; d1=datetime.strptime(a,'%d.%m.%Y').replace(tzinfo=LOCAL_TZ); d2=datetime.strptime(b,'%d.%m.%Y').replace(tzinfo=LOCAL_TZ)+timedelta(days=1)
             async with db_pool.acquire() as conn:
-                row=await conn.fetchrow("""SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE status='delivered')::int delivered,COUNT(*) FILTER(WHERE status='cancelled')::int cancelled,COALESCE(SUM(delivery_price) FILTER(WHERE status='delivered'),0) amount FROM orders WHERE created_at >= $1 AND created_at < $2""",d1,d2)
-            await state.clear(); await message.answer(f"📆 {a} — {b}\n\n📦 Создано: {row['total']}\n✅ Доставлено: {row['delivered']}\n❌ Отменено: {row['cancelled']}\n💰 Сумма: {price_text(row['amount'])}"); return
+                row=await conn.fetchrow("""SELECT
+                    (SELECT COUNT(*) FROM orders WHERE created_at >= $1 AND created_at < $2)::int AS total_created,
+                    (SELECT COUNT(DISTINCT order_id) FROM order_status_history WHERE status='delivered' AND created_at >= $1 AND created_at < $2)::int AS delivered,
+                    (SELECT COUNT(DISTINCT order_id) FROM order_status_history WHERE status='cancelled' AND created_at >= $1 AND created_at < $2)::int AS cancelled,
+                    (SELECT COUNT(*) FROM order_status_history WHERE status='postponed' AND created_at >= $1 AND created_at < $2)::int AS postponed,
+                    (SELECT COUNT(DISTINCT order_id) FROM order_status_history WHERE status='problem' AND created_at >= $1 AND created_at < $2)::int AS problems,
+                    COALESCE((SELECT SUM(o.delivery_price) FROM orders o WHERE o.id IN (SELECT DISTINCT h.order_id FROM order_status_history h WHERE h.status='delivered' AND h.created_at >= $1 AND h.created_at < $2)),0) AS amount""",d1,d2)
+            await state.clear(); await message.answer(f"📆 {a} — {b}\n\n📦 Создано: {row['total_created']}\n✅ Доставлено: {row['delivered']}\n❌ Отменено: {row['cancelled']}\n🗓 Переносов: {row['postponed']}\n⚠️ Проблем: {row['problems']}\n💰 Сумма: {price_text(row['amount'])}"); return
         day=datetime.strptime(raw,'%d.%m.%Y').replace(tzinfo=LOCAL_TZ); await state.clear(); text,kb=await build_daily_statistics(day); await message.answer(text,reply_markup=kb)
     except Exception:
         await message.answer("❌ Неверный формат. Используйте ДД.ММ.ГГГГ или ДД.ММ.ГГГГ-ДД.ММ.ГГГГ.")
 
 async def send_stats_orders(message,day_text,search=None):
-    day=datetime.strptime(day_text,'%Y-%m-%d').replace(tzinfo=LOCAL_TZ); finish=day+timedelta(days=1)
+    day=datetime.strptime(day_text,'%Y-%m-%d').replace(tzinfo=LOCAL_TZ); finish=day+timedelta(days=1); query=(search or '').strip() or None
+    pattern=None if not query else f"%{query}%"
     async with db_pool.acquire() as conn:
-        rows=await conn.fetch("""SELECT o.id,o.kittek_order_number,o.client_name,o.status,s.store_name,COALESCE(c.full_name,'Не назначен') courier_name FROM orders o JOIN stores s ON s.id=o.store_id LEFT JOIN couriers c ON c.id=o.courier_id WHERE o.created_at >= $1 AND o.created_at < $2 AND ($3::text IS NULL OR o.id::text ILIKE $3 OR COALESCE(o.kittek_order_number,'') ILIKE $3 OR COALESCE(c.full_name,'') ILIKE $3 OR s.store_name ILIKE $3) ORDER BY o.id""",day,finish,None if not search else f"%{search}%")
+        rows=await conn.fetch("""WITH day_events AS (
+            SELECT h.order_id,MAX(h.created_at) AS event_at FROM order_status_history h WHERE h.created_at >= $1 AND h.created_at < $2 GROUP BY h.order_id
+            UNION
+            SELECT o.id,o.created_at FROM orders o WHERE o.created_at >= $1 AND o.created_at < $2)
+            SELECT DISTINCT ON (o.id) o.id,o.kittek_order_number,o.client_name,o.status,o.delivery_address,s.store_name,COALESCE(c.full_name,'Не назначен') courier_name,e.event_at
+            FROM day_events e JOIN orders o ON o.id=e.order_id JOIN stores s ON s.id=o.store_id LEFT JOIN couriers c ON c.id=o.courier_id
+            WHERE ($3::text IS NULL OR o.kittek_order_number ILIKE $3 OR o.id::text ILIKE $3 OR c.full_name ILIKE $3 OR s.store_name ILIKE $3 OR o.client_name ILIKE $3 OR o.delivery_address ILIKE $3)
+            ORDER BY o.id,e.event_at DESC""",day,finish,pattern)
+    rows=sorted(rows,key=lambda r:(0 if query and str(r['kittek_order_number'] or '').strip().lower()==query.lower() else 1, r['event_at'],r['id']))
     if not rows: await message.answer("Заказы не найдены."); return
     for r in rows[:100]:
-        await message.answer(f"📦 №{r['id']} | Kittek {optional_number(r['kittek_order_number'])}\n🏪 {r['store_name']}\n👤 {r['client_name']}\n🚚 {r['courier_name']}\n{STATUS_NAMES.get(r['status'],r['status'])}",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть заказ",callback_data=f"stats_open:{r['id']}")]]))
+        local_event=r['event_at'].astimezone(LOCAL_TZ) if r['event_at'] else None
+        event_text=local_event.strftime('%d.%m.%Y %H:%M') if local_event else '—'
+        await message.answer(f"📦 Kittek №{optional_number(r['kittek_order_number'])}\n🔧 ID бота: {r['id']}\n🏪 {r['store_name']}\n👤 {r['client_name']}\n🚚 {r['courier_name']}\n📍 {r['delivery_address']}\n🕐 Событие: {event_text}\n{STATUS_NAMES.get(r['status'],r['status'])}",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть заказ",callback_data=f"stats_open:{r['id']}")]]))
 
 @dp.callback_query(F.data.startswith("stats_orders:"))
 async def stats_orders(callback:CallbackQuery):
     if await deny_admin_callback(callback): return
     await send_stats_orders(callback.message,callback.data.split(':')[1]); await callback.answer()
 
-@dp.callback_query(F.data.startswith("stats_open:"))
-async def stats_open_order(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("stats_courier_report:"))
+async def stats_courier_report(callback:CallbackQuery):
     if await deny_admin_callback(callback): return
-    order_id=int(callback.data.split(":")[1])
-    order=await get_order_full(order_id)
-    if not order:
-        await callback.answer("Заказ не найден",show_alert=True); return
-    await callback.message.answer(build_order_text(order), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🕐 История",callback_data=f"admin_history:{order_id}")]]))
-    await callback.answer()
+    day_text=callback.data.split(':',1)[1]; day=datetime.strptime(day_text,'%Y-%m-%d').replace(tzinfo=LOCAL_TZ); finish=day+timedelta(days=1)
+    async with db_pool.acquire() as conn:
+        rows=await conn.fetch("""SELECT o.id,o.kittek_order_number,o.delivery_address,COALESCE(c.full_name,'Не назначен') courier_name,MIN(h.created_at) delivered_at
+            FROM order_status_history h JOIN orders o ON o.id=h.order_id LEFT JOIN couriers c ON c.id=o.courier_id
+            WHERE h.status='delivered' AND h.created_at >= $1 AND h.created_at < $2
+            GROUP BY o.id,o.kittek_order_number,o.delivery_address,c.full_name
+            ORDER BY COALESCE(c.full_name,'Не назначен'),MIN(h.created_at),o.id""",day,finish)
+    if not rows:
+        await callback.message.answer(f"📋 Отчёт по курьерам — {day.strftime('%d.%m.%Y')}\n\nДоставленных заказов нет."); await callback.answer(); return
+    groups={}
+    for r in rows: groups.setdefault(r['courier_name'],[]).append(r)
+    for courier_name,courier_rows in groups.items():
+        lines=[f"📋 ОТЧЁТ ПО КУРЬЕРУ\n🚚 {courier_name}\n📅 {day.strftime('%d.%m.%Y')}\n📦 Заказов: {len(courier_rows)}"]
+        for i,r in enumerate(courier_rows,1): lines.append(f"{i}. Kittek №{optional_number(r['kittek_order_number'])}\n📍 {r['delivery_address']}")
+        await callback.message.answer("\n\n".join(lines))
+    await callback.answer("Отчёт сформирован.")
+
+@dp.callback_query(F.data.startswith("stats_open:"))
+async def stats_open_order(callback:CallbackQuery):
+    if await deny_admin_callback(callback): return
+    order_id=int(callback.data.split(":")[1]); order=await get_order_full(order_id)
+    if not order: await callback.answer("Заказ не найден",show_alert=True); return
+    await callback.message.answer(build_order_text(order),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🕐 История",callback_data=f"admin_history:{order_id}")]])); await callback.answer()
 
 @dp.callback_query(F.data.startswith("stats_search:"))
 async def stats_search(callback:CallbackQuery,state:FSMContext):
     if await deny_admin_callback(callback): return
-    day=callback.data.split(':')[1]; await state.set_state(AdminStatistics.search_input); await state.update_data(stats_day=day); await callback.message.answer("Введите № заказа, Kittek, имя курьера или магазин:"); await callback.answer()
+    day=callback.data.split(':')[1]; await state.set_state(AdminStatistics.search_input); await state.update_data(stats_day=day); await callback.message.answer("Введите Kittek, внутренний ID, имя курьера, магазин, клиента или адрес:"); await callback.answer()
 
 @dp.message(AdminStatistics.search_input)
 async def stats_search_input(message:Message,state:FSMContext):
@@ -12127,8 +12210,8 @@ async def admin_search_start(
     )
 
     await message.answer(
-        "🔎 Введите номер заказа.\n\n"
-        "Например: 15"
+        "🔎 Введите номер Kittek или внутренний ID заказа.\n\n"
+        "Например: 123456 или 303"
     )
 
 
@@ -12139,144 +12222,40 @@ async def admin_search_order(
     message: Message,
     state: FSMContext,
 ):
-
-    if not is_admin(
-        message.from_user.id
-    ):
-
+    if not is_admin(message.from_user.id):
         await state.clear()
-
         return
 
-    try:
-
-        order_id = int(
-            (message.text or "").strip()
-        )
-
-    except ValueError:
-
-        await message.answer(
-            "❌ Введите только номер заказа."
-        )
-
+    query = (message.text or "").strip()
+    if not query:
+        await message.answer("❌ Введите номер Kittek или внутренний ID заказа.")
         return
 
     await state.clear()
-
-    order = await get_order_full(
-        order_id
-    )
-
-    if not order:
-
-        await message.answer(
-            f"❌ Заказ №{order_id} не найден."
+    async with db_pool.acquire() as conn:
+        order = await conn.fetchrow(
+            """
+            SELECT o.*, s.store_name, c.full_name AS courier_name,
+                   c.phone AS courier_phone, c.vehicle AS courier_vehicle,
+                   c.telegram_id AS courier_telegram_id, su.full_name AS created_by
+            FROM orders o
+            JOIN stores s ON s.id = o.store_id
+            LEFT JOIN couriers c ON c.id = o.courier_id
+            LEFT JOIN store_users su ON su.telegram_id = o.created_by_telegram_id
+            WHERE o.kittek_order_number = $1 OR o.id::text = $1
+            ORDER BY CASE WHEN o.kittek_order_number = $1 THEN 0 ELSE 1 END, o.id DESC
+            LIMIT 1
+            """, query,
         )
 
+    if not order:
+        await message.answer(f"❌ Заказ по Kittek/ID «{query}» не найден.")
         return
 
-    buttons = [
-        [
-            InlineKeyboardButton(
-                text="🕐 История",
-                callback_data=(
-                    f"admin_history:"
-                    f"{order_id}"
-                ),
-            ),
-
-            InlineKeyboardButton(
-                text="📸 Фото",
-                callback_data=(
-                    f"admin_photos:"
-                    f"{order_id}"
-                ),
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text="💰 Стоимость",
-                callback_data=(
-                    f"set_price:"
-                    f"{order_id}"
-                ),
-            )
-        ],
-    ]
-
-    if order["status"] not in (
-        "delivered",
-        "cancelled",
-    ):
-
-        if order["status"] == "problem":
-
-            buttons.append([
-                InlineKeyboardButton(
-                    text="▶️ Продолжить после проблемы",
-                    callback_data=(
-                        f"problem_continue:"
-                        f"{order_id}"
-                    ),
-                )
-            ])
-
-        if order["status"] not in (
-            "new",
-            "postponed",
-        ):
-
-            buttons.append([
-                InlineKeyboardButton(
-                    text="🔄 Сменить курьера",
-                    callback_data=(
-                        f"reassign_order:"
-                        f"{order_id}"
-                    ),
-                )
-            ])
-
-        buttons.append([
-            InlineKeyboardButton(
-                text="🗓 Перенести",
-                callback_data=(
-                    f"admin_reschedule:"
-                    f"{order_id}"
-                ),
-            )
-        ])
-
-        buttons.append([
-            InlineKeyboardButton(
-                text="✅ Завершить вручную",
-                callback_data=(
-                    f"admin_complete:"
-                    f"{order_id}"
-                ),
-            )
-        ])
-
-        buttons.append([
-            InlineKeyboardButton(
-                text="❌ Отменить заказ",
-                callback_data=(
-                    f"cancel_order_admin:"
-                    f"{order_id}"
-                ),
-            )
-        ])
-
     await message.answer(
-        build_order_text(
-            order
-        ),
-
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        ),
+        build_order_text(order, title=f"📦 Kittek №{optional_number(order['kittek_order_number'])}\n🔧 ID бота: {order['id']}"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🕐 История", callback_data=f"admin_history:{order['id']}")]])
     )
-
 
 
 # =========================================================
@@ -12330,18 +12309,17 @@ async def admin_history(
 
         return
 
+    order = await get_order_full(order_id)
     text = (
-        f"🕐 ИСТОРИЯ ЗАКАЗА №"
-        f"{order_id}\n\n"
+        f"🕐 ИСТОРИЯ ЗАКАЗА\n"
+        f"🔢 Kittek №: {optional_number(order['kittek_order_number']) if order else '—'}\n"
+        f"🔧 ID бота: {order_id}\n\n"
     )
 
     for row in history:
 
         time_text = (
-            row["created_at"]
-            .strftime(
-                "%d.%m.%Y %H:%M"
-            )
+            row["created_at"].astimezone(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
         )
 
         text += (
@@ -14098,7 +14076,7 @@ async def show_reschedule_menu(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🌙 Через 24 часа",
+                    text="🌅 На завтра, 09:00",
                     callback_data=(
                         f"reschedule_24:"
                         f"{actor}:{order_id}"
@@ -14268,10 +14246,7 @@ async def reschedule_24_hours(
 
             return
 
-    scheduled_for = (
-        datetime.now(LOCAL_TZ)
-        + timedelta(hours=24)
-    )
+    scheduled_for = next_morning_09_local()
 
     result = await postpone_existing_order(
         order_id,
@@ -14279,7 +14254,7 @@ async def reschedule_24_hours(
         actor,
         callback.from_user.id,
         (
-            "Заказ перенесён на 24 часа: "
+            "Заказ перенесён на завтрашнее утро: "
             f"{scheduled_for.strftime('%d.%m.%Y %H:%M')}"
         ),
     )
@@ -14299,7 +14274,7 @@ async def reschedule_24_hours(
 
     await callback.message.answer(
         f"✅ Заказ №{order_id} перенесён.\n\n"
-        f"🗓 Повторная публикация: "
+        f"🗓 Завтра в 09:00: "
         f"{scheduled_for.strftime('%d.%m.%Y %H:%M')}"
     )
 
