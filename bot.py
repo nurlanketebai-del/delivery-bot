@@ -822,6 +822,20 @@ async def init_db():
             """
         )
 
+        # Backfill courier snapshots for historical courier events where
+        # the old version only stored actor_telegram_id. This is lossless:
+        # it fills only NULL snapshot values and never invents queue order.
+        await conn.execute(
+            """
+            UPDATE order_status_history h
+            SET courier_id_at_event = c.id
+            FROM couriers c
+            WHERE h.courier_id_at_event IS NULL
+              AND h.actor_type = 'courier'
+              AND h.actor_telegram_id = c.telegram_id
+            """
+        )
+
         # =================================================
         # ОТДЕЛЬНАЯ TELEGRAM-ГРУППА ДЛЯ КАЖДОГО МАГАЗИНА
         # =================================================
@@ -1809,7 +1823,7 @@ async def release_postponed_orders():
                         updated_at = NOW()
                     WHERE id = $1
                       AND status = 'postponed'
-                    RETURNING id, store_id, created_by_telegram_id
+                    RETURNING id, store_id, created_by_telegram_id, kittek_order_number
                     """,
                     row["id"],
                 )
@@ -1867,7 +1881,11 @@ async def send_order_to_admin(
             ADMIN_ID,
             build_order_text(
                 order,
-                title=f"🆕 НОВЫЙ ЗАКАЗ №{order_id}",
+                title=(
+                    f"🆕 НОВЫЙ ЗАКАЗ — Kittek №"
+                    f"{optional_number(order['kittek_order_number'])}"
+                    f"\n🔧 ID бота: {order_id}"
+                ),
             ),
         )
 
@@ -4453,7 +4471,11 @@ async def register_store_confirm(
                         EXCLUDED.address,
 
                     status =
-                        'pending'
+                        CASE
+                            WHEN stores.status = 'approved'
+                            THEN 'approved'
+                            ELSE 'pending'
+                        END
 
                 RETURNING id
                 """,
@@ -10545,12 +10567,9 @@ async def on_way(
         "🚗 Вы выехали к клиенту."
     )
 
-
     await update_store_status_message(
         order_id
     )
-
-    await callback.answer()
 
 
 
@@ -11486,13 +11505,8 @@ async def delivered(
         reply_markup=courier_keyboard,
     )
 
-
     await update_store_status_message(
         order_id
-    )
-
-    await callback.answer(
-        "Доставка завершена."
     )
 
 
@@ -11952,8 +11966,28 @@ async def send_stats_orders(message, day_text, search=None):
 
 
 async def send_courier_report(message: Message, start, finish):
-    """Send one message per courier, ordered by historical queue position."""
+    """
+    Build a courier report for the selected local-Almaty date/period.
+
+    Every current courier receives a separate message, including couriers
+    with zero deliveries in the selected period. Historical delivered events
+    use the courier/queue snapshot saved in order_status_history. For old
+    history rows created before snapshot support existed, courier identity is
+    recovered from actor_telegram_id where possible; queue position is left
+    unknown rather than guessed.
+    """
     async with db_pool.acquire() as conn:
+        couriers = await conn.fetch(
+            """
+            SELECT id, full_name, status
+            FROM couriers
+            ORDER BY
+                CASE WHEN status = 'approved' THEN 0 ELSE 1 END,
+                full_name,
+                id
+            """
+        )
+
         rows = await conn.fetch(
             """
             WITH delivered AS (
@@ -11961,7 +11995,8 @@ async def send_courier_report(message: Message, start, finish):
                     h.order_id,
                     h.created_at AS delivered_at,
                     h.courier_id_at_event,
-                    h.queue_position_at_event
+                    h.queue_position_at_event,
+                    h.actor_telegram_id
                 FROM order_status_history h
                 WHERE h.status = 'delivered'
                   AND h.created_at >= $1
@@ -11973,15 +12008,34 @@ async def send_courier_report(message: Message, start, finish):
                 o.kittek_order_number,
                 o.delivery_address,
                 d.delivered_at,
-                COALESCE(d.courier_id_at_event, o.courier_id) AS courier_id,
-                COALESCE(c.full_name, 'Не назначен') AS courier_name,
+                COALESCE(
+                    d.courier_id_at_event,
+                    actor_c.id,
+                    o.courier_id
+                ) AS courier_id,
+                COALESCE(
+                    event_c.full_name,
+                    actor_c.full_name,
+                    current_c.full_name,
+                    'Не назначен'
+                ) AS courier_name,
                 d.queue_position_at_event
             FROM delivered d
-            JOIN orders o ON o.id = d.order_id
-            LEFT JOIN couriers c
-                ON c.id = COALESCE(d.courier_id_at_event, o.courier_id)
+            JOIN orders o
+                ON o.id = d.order_id
+            LEFT JOIN couriers event_c
+                ON event_c.id = d.courier_id_at_event
+            LEFT JOIN couriers actor_c
+                ON actor_c.telegram_id = d.actor_telegram_id
+            LEFT JOIN couriers current_c
+                ON current_c.id = o.courier_id
             ORDER BY
-                COALESCE(c.full_name, 'Не назначен'),
+                COALESCE(
+                    event_c.full_name,
+                    actor_c.full_name,
+                    current_c.full_name,
+                    'Не назначен'
+                ),
                 COALESCE(d.queue_position_at_event, 2147483647),
                 d.delivered_at,
                 o.id
@@ -11996,30 +12050,66 @@ async def send_courier_report(message: Message, start, finish):
         else f"{start.strftime('%d.%m.%Y')} — {end_inclusive.strftime('%d.%m.%Y')}"
     )
 
-    if not rows:
+    # Group by stable courier_id rather than by name. Two couriers can have
+    # identical names, so using the display name as the dictionary key can
+    # silently merge their reports.
+    groups = {}
+    for row in rows:
+        courier_id = row['courier_id']
+        if courier_id is not None:
+            groups.setdefault(courier_id, []).append(row)
+
+    courier_map = {row['id']: row['full_name'] for row in couriers}
+
+    # If a historical row belongs to a courier that no longer exists, retain
+    # it in a separate historical group instead of losing the delivery.
+    for row in rows:
+        courier_id = row['courier_id']
+        if courier_id is not None and courier_id not in courier_map:
+            courier_map[courier_id] = row['courier_name'] or 'Неизвестный курьер'
+
+    if not courier_map:
         await message.answer(
             f"📋 ОТЧЁТ ПО КУРЬЕРАМ\n📅 {period_label}\n\n"
-            "Доставленных заказов нет."
+            "Курьеры не зарегистрированы."
         )
         return
 
-    groups = {}
-    for row in rows:
-        groups.setdefault(row['courier_name'], []).append(row)
+    for courier_id, courier_name in sorted(
+        courier_map.items(),
+        key=lambda item: (str(item[1] or '').lower(), item[0]),
+    ):
+        courier_rows = groups.get(courier_id, [])
 
-    for courier_name, courier_rows in groups.items():
+        # Exact historical queue position first; when it is unavailable in
+        # legacy history, fall back to the actual delivery event time.
+        courier_rows.sort(
+            key=lambda row: (
+                row['queue_position_at_event']
+                if row['queue_position_at_event'] is not None
+                else 2147483647,
+                row['delivered_at'],
+                row['id'],
+            )
+        )
+
         lines = [
             "📋 ОТЧЁТ ПО КУРЬЕРУ",
-            f"🚚 {courier_name}",
+            f"🚚 {courier_name or 'Не указан'}",
             f"📅 {period_label}",
             f"📦 Заказов: {len(courier_rows)}",
             "",
         ]
-        for index, row in enumerate(courier_rows, start=1):
-            lines.append(
-                f"{index}. Kittek №{optional_number(row['kittek_order_number'])}\n"
-                f"📍 {row['delivery_address']}"
-            )
+
+        if courier_rows:
+            for row in courier_rows:
+                lines.append(
+                    f"Kittek №{optional_number(row['kittek_order_number'])}\n"
+                    f"📍 {row['delivery_address'] or 'Адрес не указан'}"
+                )
+        else:
+            lines.append("Доставленных заказов за выбранный период нет.")
+
         await message.answer("\n\n".join(lines))
 
 
