@@ -1,10 +1,9 @@
-# PRODUCTION REBUILD: based on bot_production_manager_orders_ui_documents.py;
-# tasks 1-5 integrated with backward-compatible DB migrations.
 import os
 import asyncio
 import secrets
 import string
 import re
+import random
 from urllib.parse import quote_plus
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -12,7 +11,7 @@ from decimal import Decimal, InvalidOperation
 
 import asyncpg
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.enums import ChatType
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -65,6 +64,132 @@ dp = Dispatcher(
 
 db_pool = None
 
+
+# =========================================================
+# ПАСХАЛКИ И РЕАКЦИИ НА ПОВТОРНЫЕ НАЖАТИЯ
+# =========================================================
+
+EASTER_EGGS_ENABLED = True
+
+REPEAT_ACTION_TEXTS = {
+    "➕ Создать заказ",
+    "⚡ Быстрый заказ",
+    "📦 Мои заказы",
+    "📊 Статистика магазина",
+    "🏪 Профиль магазина",
+    "👥 Менеджеры",
+    "📦 Мои доставки",
+    "📊 Моя статистика",
+    "🚚 Профиль курьера",
+    "📦 Новые заказы",
+    "🚚 Активные",
+    "✅ Доставленные",
+    "🔎 Найти заказ",
+    "📊 Статистика",
+    "🧾 Очереди",
+    "🏪 Магазины",
+    "🚚 Курьеры",
+}
+
+_repeat_action_locks = {}
+
+REPEAT_REACTIONS = (
+    "🙂 Куда спешим? Я ещё обрабатываю предыдущий запрос.",
+    "😄 Одного нажатия достаточно — я уже занимаюсь этим.",
+    "⏳ Секунду. Не надо нажимать кнопку второй раз.",
+    "😂 Я понял с первого раза. Дай мне закончить.",
+)
+
+COURIER_PRAISE_EGGS = (
+    "⚡ {name} сегодня как молния.",
+    "🔥 {name} сегодня работает чётко.",
+    "🚀 {name} — хороший темп сегодня.",
+)
+
+COURIER_LAST_BEFORE_EGGS = (
+    "🏁 Последний и домой!",
+    "🏁 Ещё один — и можно отдыхать.",
+    "🏁 Финальный заказ, {name}.",
+)
+
+COURIER_LAST_AFTER_EGGS = (
+    "😎 {name} закончил, хорошего отдыха.",
+    "🏠 {name} всё, на сегодня готово. Хорошего отдыха.",
+    "😌 {name} закончил смену. Можно выдыхать.",
+)
+
+MANAGER_EGGS = (
+    "😄 Много продал — много заработал.",
+    "📈 Заказов прибавляется. Касса довольна.",
+    "💰 Похоже, сегодня хороший день для продаж.",
+)
+
+
+def repeat_action_lock_key(message):
+    if not message or not message.from_user:
+        return None
+    if message.chat.type not in {ChatType.PRIVATE}:
+        return None
+    text = (message.text or "").strip()
+    if text not in REPEAT_ACTION_TEXTS:
+        return None
+    return (message.from_user.id, text)
+
+
+async def duplicate_action_guard(message: Message):
+    """Return True when the same menu action is already being processed."""
+    key = repeat_action_lock_key(message)
+    if key is None:
+        return False
+    lock = _repeat_action_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _repeat_action_locks[key] = lock
+    if lock.locked():
+        if EASTER_EGGS_ENABLED:
+            await message.answer(random.choice(REPEAT_REACTIONS))
+        return True
+    await lock.acquire()
+    return False
+
+
+async def release_duplicate_action_guard(message: Message):
+    key = repeat_action_lock_key(message)
+    if key is None:
+        return
+    lock = _repeat_action_locks.get(key)
+    if lock and lock.locked():
+        lock.release()
+    if lock and not lock.locked():
+        _repeat_action_locks.pop(key, None)
+
+
+
+
+class DuplicateActionMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if isinstance(event, Message):
+            key = repeat_action_lock_key(event)
+            if key is not None:
+                lock = _repeat_action_locks.get(key)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    _repeat_action_locks[key] = lock
+                if lock.locked():
+                    if EASTER_EGGS_ENABLED:
+                        await event.answer(random.choice(REPEAT_REACTIONS))
+                    return None
+                await lock.acquire()
+                try:
+                    return await handler(event, data)
+                finally:
+                    if lock.locked():
+                        lock.release()
+                    _repeat_action_locks.pop(key, None)
+        return await handler(event, data)
+
+
+dp.message.middleware(DuplicateActionMiddleware())
 
 # =========================================================
 # СТАТУСЫ
@@ -167,15 +292,13 @@ class AdminSearch(StatesGroup):
     order_id = State()
 
 
-class AdminStatistics(StatesGroup):
-    date_start = State()
-    period_start = State()
-    courier_date = State()
-    courier_period = State()
-
-
 class AdminPrice(StatesGroup):
     value = State()
+
+
+class AdminStatistics(StatesGroup):
+    date_input = State()
+    search_input = State()
 
 
 class OrderReschedule(StatesGroup):
@@ -442,11 +565,6 @@ admin_keyboard = ReplyKeyboardMarkup(
             ),
             KeyboardButton(
                 text="🧾 Очереди"
-            ),
-        ],
-        [
-            KeyboardButton(
-                text="📋 Отчёт по курьерам"
             ),
         ],
         [
@@ -738,25 +856,6 @@ async def init_db():
 
         await conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS courier_queue_history (
-                id SERIAL PRIMARY KEY,
-                courier_id INTEGER NOT NULL REFERENCES couriers(id) ON DELETE CASCADE,
-                order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-                queue_position INTEGER NOT NULL,
-                recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            """
-        )
-
-        await conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_courier_queue_history_lookup
-            ON courier_queue_history (courier_id, order_id, recorded_at DESC)
-            """
-        )
-
-        await conn.execute(
-            """
             CREATE INDEX IF NOT EXISTS idx_orders_rescheduled_due
             ON orders (rescheduled_for)
             WHERE status = 'postponed'
@@ -778,6 +877,9 @@ async def init_db():
 
                 member_role TEXT NOT NULL
                     DEFAULT 'manager',
+
+                is_active BOOLEAN NOT NULL
+                    DEFAULT TRUE,
 
                 created_at TIMESTAMPTZ
                     NOT NULL DEFAULT NOW()
@@ -828,9 +930,32 @@ async def init_db():
 
                 note TEXT,
 
-                created_at TIMESTAMPTZ
-                    NOT NULL DEFAULT NOW()
+                courier_id_at_event INTEGER,
+                queue_position_at_event INTEGER,
+
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
+            """
+        )
+
+        await conn.execute(
+            """
+            ALTER TABLE order_status_history
+            ADD COLUMN IF NOT EXISTS courier_id_at_event INTEGER
+            """
+        )
+
+        await conn.execute(
+            """
+            ALTER TABLE order_status_history
+            ADD COLUMN IF NOT EXISTS queue_position_at_event INTEGER
+            """
+        )
+
+        await conn.execute(
+            """
+            ALTER TABLE store_users
+            ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE
             """
         )
 
@@ -1071,6 +1196,19 @@ def price_text(value) -> str:
     )
 
 
+def primary_order_number(order) -> str:
+    """Business-facing order identifier: Kittek first, bot DB id second."""
+    kittek = str(order.get("kittek_order_number") or "").strip() if hasattr(order, "get") else ""
+    return kittek or str(order.get("id") or "—")
+
+
+def next_morning_09_local(now=None):
+    now = now or datetime.now(LOCAL_TZ)
+    local_now = now.astimezone(LOCAL_TZ)
+    tomorrow = local_now.date() + timedelta(days=1)
+    return datetime(tomorrow.year, tomorrow.month, tomorrow.day, 9, 0, tzinfo=LOCAL_TZ)
+
+
 def optional_number(value):
 
     if value is None:
@@ -1096,31 +1234,21 @@ async def get_store_membership(
             """
             SELECT
                 su.id AS store_user_id,
-
                 su.store_id,
-
                 su.telegram_id,
-
                 su.full_name,
-
                 su.member_role,
-
                 s.store_name,
-
                 s.contact_name,
-
                 s.phone,
-
                 s.address,
-
                 s.status
-
             FROM store_users su
-
             JOIN stores s
                 ON s.id = su.store_id
-
             WHERE su.telegram_id = $1
+              AND su.is_active = TRUE
+              AND s.status <> 'deleted' 
             """,
             user_id,
         )
@@ -1174,6 +1302,13 @@ async def get_user_role(
     courier = await get_courier(
         user_id
     )
+
+    # Soft-deleted identities must not receive an active role.
+    if store and store["status"] == "deleted":
+        store = None
+
+    if courier and courier["status"] == "deleted":
+        courier = None
 
     if (
         store
@@ -1252,7 +1387,29 @@ async def add_history(
     actor_type=None,
     actor_telegram_id=None,
     note=None,
+    courier_id_at_event=None,
+    queue_position_at_event=None,
 ):
+    """Append immutable status history, including courier/queue snapshot.
+
+    Existing callers continue to work. If a caller does not explicitly pass
+    a snapshot, capture the current order values before any later queue
+    normalization can change them.
+    """
+    if courier_id_at_event is None or queue_position_at_event is None:
+        snapshot = await conn.fetchrow(
+            """
+            SELECT courier_id, queue_position
+            FROM orders
+            WHERE id = $1
+            """,
+            order_id,
+        )
+        if snapshot:
+            if courier_id_at_event is None:
+                courier_id_at_event = snapshot["courier_id"]
+            if queue_position_at_event is None:
+                queue_position_at_event = snapshot["queue_position"]
 
     await conn.execute(
         """
@@ -1261,16 +1418,19 @@ async def add_history(
             status,
             actor_type,
             actor_telegram_id,
-            note
+            note,
+            courier_id_at_event,
+            queue_position_at_event
         )
-
-        VALUES ($1,$2,$3,$4,$5)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
         """,
         order_id,
         status,
         actor_type,
         actor_telegram_id,
         note,
+        courier_id_at_event,
+        queue_position_at_event,
     )
 
 
@@ -1361,6 +1521,9 @@ async def get_order_full(
                 c.vehicle
                     AS courier_vehicle,
 
+                c.telegram_id
+                    AS courier_telegram_id,
+
                 su.full_name
                     AS created_by
 
@@ -1389,11 +1552,7 @@ def build_order_text(
 
     title = (
         title
-        or (
-            f"📦 ЗАКАЗ — Kittek №{optional_number(order['kittek_order_number'])}"
-            if order.get("kittek_order_number")
-            else f"📦 ЗАКАЗ №{order['id']}"
-        )
+        or f"📦 KITTEK №{optional_number(order['kittek_order_number'])}"
     )
 
     courier_name = (
@@ -1809,7 +1968,8 @@ async def release_postponed_orders():
         try:
             await bot.send_message(
                 order["created_by_telegram_id"],
-                f"🚀 Заказ №{order['id']} повторно опубликован по расписанию.",
+                f"🚀 Kittek №{optional_number(order['kittek_order_number'])} повторно опубликован по расписанию.\n"
+                f"🔧 ID бота: {order['id']}",
             )
         except Exception:
             pass
@@ -1841,7 +2001,11 @@ async def send_order_to_admin(
             ADMIN_ID,
             build_order_text(
                 order,
-                title=f"🆕 НОВЫЙ ЗАКАЗ №{order_id}",
+                title=(
+                    f"🆕 НОВЫЙ ЗАКАЗ — Kittek №"
+                    f"{optional_number(order['kittek_order_number'])}"
+                    f"\n🔧 ID бота: {order_id}"
+                ),
             ),
         )
 
@@ -1851,7 +2015,8 @@ async def send_order_to_admin(
                     chat_id=ADMIN_ID,
                     document=document["file_id"],
                     caption=(
-                        f"📎 Kittek №: {optional_number(order['kittek_order_number'])}\n"
+                        f"📎 Kittek №{optional_number(order['kittek_order_number'])}\n"
+                        f"🔧 ID бота: {order_id}\n"
                         f"{document['file_name'] or 'Документ'}"
                     ),
                 )
@@ -1886,8 +2051,7 @@ async def publish_new_order(
             title=(
                 f"🆕 НОВЫЙ ЗАКАЗ — Kittek №"
                 f"{optional_number(order['kittek_order_number'])}"
-                if order.get("kittek_order_number")
-                else f"🆕 НОВЫЙ ЗАКАЗ №{order_id}"
+                f"\n🔧 ID бота: {order_id}"
             ),
         ),
     )
@@ -1900,6 +2064,15 @@ async def publish_new_order(
     await send_order_to_preparation_topic(
         order_id
     )
+
+    if EASTER_EGGS_ENABLED and random.random() < 0.08:
+        order_text = build_order_text(order)
+        if len(order_text.splitlines()) > 5:
+            await send_store_topic_text(
+                order["store_id"],
+                "orders",
+                random.choice(MANAGER_EGGS),
+            )
 
     await send_order_to_admin(
         order_id
@@ -2171,6 +2344,7 @@ async def send_store_topic_text(
             chat_id=chat_id,
             message_thread_id=topic_id,
             text=text,
+            parse_mode="HTML",
         )
 
     except Exception as error:
@@ -2277,7 +2451,10 @@ async def build_store_status_timeline(
             SELECT
                 o.*,
                 s.store_name,
-                c.full_name AS courier_name
+                c.full_name AS courier_name,
+                c.telegram_id AS courier_telegram_id,
+                su.full_name AS created_by,
+                o.created_by_telegram_id AS creator_telegram_id
 
             FROM orders o
 
@@ -2286,6 +2463,10 @@ async def build_store_status_timeline(
 
             LEFT JOIN couriers c
                 ON c.id = o.courier_id
+
+            LEFT JOIN store_users su
+                ON su.telegram_id = o.created_by_telegram_id
+               AND su.store_id = o.store_id
 
             WHERE o.id = $1
             """,
@@ -2358,16 +2539,42 @@ async def build_store_status_timeline(
     if not lines:
         return order, None
 
+    # Live queue block and clickable Telegram profiles.
+    queue_text = ""
+    if order["courier_id"] and order["status"] in QUEUE_ACTIVE_STATUSES:
+        queue_info = await get_order_queue_info(order_id)
+        position = queue_info.get("position")
+        ahead = queue_info.get("ahead", 0)
+        if position == 1:
+            queue_text = "\n▶️ Очередь: текущий заказ"
+        elif position:
+            queue_text = (
+                f"\n📋 Очередь: №{position}"
+                f"\n⏳ Перед ним: {ahead} заказ(а)"
+            )
+
+    def tg_link(name, telegram_id):
+        import html
+        safe_name = html.escape(str(name or "Не указан"))
+        if telegram_id:
+            return f'<a href="tg://user?id={int(telegram_id)}">{safe_name}</a>'
+        return safe_name
+
+    courier_display = tg_link(order["courier_name"], order["courier_telegram_id"]) if order["courier_name"] else "Не назначен"
+    creator_display = tg_link(order["created_by"], order["creator_telegram_id"])
+
     text = (
-        f"📦 СТАТУС ЗАКАЗА №{order_id}\n\n"
-        f"🔢 Kittek №: "
-        f"{optional_number(order['kittek_order_number'])}\n"
+        f"📦 СТАТУС ЗАКАЗА — Kittek №{optional_number(order['kittek_order_number'])}\n"
+        f"🔧 ID бота: {order_id}\n\n"
         f"🛒 Kaspi №: "
-        f"{optional_number(order['kaspi_order_number'])}\n"
+        f"{__import__('html').escape(str(optional_number(order['kaspi_order_number'])))}\n"
+        f"👤 Создал: {creator_display}\n"
+        f"🚚 Курьер: {courier_display}"
+        f"{queue_text}\n\n"
         f"👤 Клиент: "
-        f"{order['client_name']}\n"
-        f"📍 {order['delivery_address']}\n\n"
-        + "\n".join(lines)
+        f"{__import__('html').escape(str(order['client_name']))}\n"
+        f"📍 {__import__('html').escape(str(order['delivery_address']))}\n\n"
+        + "\n".join(__import__('html').escape(str(x)) for x in lines)
     )
 
     return order, text
@@ -2431,6 +2638,7 @@ async def update_store_status_message(
                 chat_id=chat_id,
                 message_id=saved_message_id,
                 text=text,
+                parse_mode="HTML",
             )
 
             return
@@ -2459,6 +2667,7 @@ async def update_store_status_message(
             chat_id=chat_id,
             message_thread_id=topic_id,
             text=text,
+            parse_mode="HTML",
         )
 
     except Exception as error:
@@ -2830,21 +3039,33 @@ async def send_order_documents_to_group(
     order_id: int,
     store_id: int,
 ):
-    order = await get_order_full(order_id)
-    if not order:
-        return
-    documents = await get_order_documents(order_id)
+
+    documents = await get_order_documents(
+        order_id
+    )
+
     if not documents:
         return
+
     total = len(documents)
-    kittek = optional_number(order["kittek_order_number"])
-    for index, document in enumerate(documents, start=1):
-        file_name = document["file_name"] or "Документ"
+
+    for index, document in enumerate(
+        documents,
+        start=1,
+    ):
+
+        file_name = (
+            document["file_name"]
+            or "Документ"
+        )
+
         caption = (
-            f"📎 Kittek №: {kittek}\n"
+            f"📎 Kittek №{optional_number(order['kittek_order_number'])}\n"
+            f"🔧 ID бота: {order_id}\n"
             f"Документ {index}/{total}\n"
             f"📄 {file_name}"
         )
+
         await send_store_topic_document(
             store_id=store_id,
             file_id=document["file_id"],
@@ -2876,10 +3097,8 @@ async def build_status_report(
     return (
         f"{headline}\n\n"
 
-        f"📦 Заказ №{order_id}\n"
-
-        f"🔢 Kittek №: "
-        f"{optional_number(order['kittek_order_number'])}\n"
+        f"📦 Kittek №: {optional_number(order['kittek_order_number'])}\n"
+        f"🔧 ID бота: {order_id}\n"
 
         f"🛒 Kaspi №: "
         f"{optional_number(order['kaspi_order_number'])}\n\n"
@@ -3083,13 +3302,10 @@ async def get_courier_order_card(
             )
 
     text = (
-        (
-            f"🚚 ЗАКАЗ — Kittek №{optional_number(order['kittek_order_number'])}\n\n"
-            if order.get("kittek_order_number")
-            else f"🚚 ЗАКАЗ №{order['id']}\n\n"
-        )
+        f"🚚 KITTEK №{optional_number(order['kittek_order_number'])}\n"
+        f"🔧 ID бота: {order['id']}\n\n"
 
-        + f"🔢 Kittek №: "
+        f"🔢 Kittek №: "
         f"{optional_number(order['kittek_order_number'])}\n"
 
         f"🛒 Kaspi №: "
@@ -4418,7 +4634,9 @@ async def register_store_confirm(
                         EXCLUDED.full_name,
 
                     member_role =
-                        'owner'
+                        'owner',
+
+                    is_active = TRUE
                 """,
                 store_id,
                 message.from_user.id,
@@ -4539,6 +4757,25 @@ async def join_store_code(
 
                 return
 
+            existing_member = await conn.fetchrow(
+                """
+                SELECT store_id, is_active
+                FROM store_users
+                WHERE telegram_id = $1
+                """,
+                message.from_user.id,
+            )
+
+            if (
+                existing_member
+                and existing_member["store_id"] != invite["store_id"]
+            ):
+                await message.answer(
+                    "❌ Этот аккаунт уже связан с историей другого магазина. "
+                    "Для сохранения истории нельзя перенести его в другой магазин автоматически."
+                )
+                return
+
             await conn.execute(
                 """
                 INSERT INTO store_users (
@@ -4562,7 +4799,9 @@ async def join_store_code(
                         EXCLUDED.full_name,
 
                     member_role =
-                        'manager'
+                        'manager',
+
+                    is_active = TRUE
                 """,
                 invite["store_id"],
                 message.from_user.id,
@@ -4634,6 +4873,7 @@ async def managers_handler(
             FROM store_users
 
             WHERE store_id = $1
+              AND is_active = TRUE
 
             ORDER BY
                 CASE
@@ -4861,6 +5101,7 @@ async def remove_manager_confirm(
 
             WHERE store_id = $1
               AND telegram_id = $2
+              AND is_active = TRUE
             """,
             membership["store_id"],
             manager_id,
@@ -4959,6 +5200,7 @@ async def confirm_remove_manager(
 
             WHERE store_id = $1
               AND telegram_id = $2
+              AND is_active = TRUE
             """,
             membership["store_id"],
             manager_id,
@@ -4984,11 +5226,12 @@ async def confirm_remove_manager(
 
         await conn.execute(
             """
-            DELETE FROM store_users
-
+            UPDATE store_users
+            SET is_active = FALSE
             WHERE store_id = $1
               AND telegram_id = $2
               AND member_role = 'manager'
+              AND is_active = TRUE
             """,
             membership["store_id"],
             manager_id,
@@ -7533,7 +7776,8 @@ async def send_regular_store_orders(
                 )
 
         await target_message.answer(
-            f"📦 ЗАКАЗ №{order['id']}\n\n"
+            f"📦 KITTEK №{optional_number(order['kittek_order_number'])}\n"
+            f"🔧 ID бота: {order['id']}\n\n"
             f"Статус: "
             f"{STATUS_NAMES.get(order['status'], order['status'])}\n"
             f"💰 Стоимость: "
@@ -7868,16 +8112,18 @@ async def store_history(
             order_id,
         )
 
+    order = await get_order_full(order_id)
     text = (
-        f"🕐 ИСТОРИЯ ЗАКАЗА №"
-        f"{order_id}\n\n"
+        f"🕐 ИСТОРИЯ ЗАКАЗА\n"
+        f"🔢 Kittek №: {optional_number(order['kittek_order_number']) if order else '—'}\n"
+        f"🔧 ID бота: {order_id}\n\n"
     )
 
     for row in history:
 
-        created_at = row["created_at"]
-        local_time = created_at.astimezone(LOCAL_TZ) if created_at else None
-        time_text = local_time.strftime("%d.%m.%Y %H:%M") if local_time else "-"
+        time_text = (
+            row["created_at"].astimezone(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+        )
 
         text += (
             f"{STATUS_NAMES.get(row['status'], row['status'])}\n"
@@ -9716,6 +9962,7 @@ async def courier_full_queue(
                 o.id,
                 o.queue_position,
                 o.status,
+                o.kittek_order_number,
                 o.client_name,
                 o.delivery_address,
                 o.delivery_time
@@ -9790,7 +10037,8 @@ async def courier_full_queue(
 
         text += (
             f"{prefix} {position_text} — "
-            f"заказ №{order['id']}\n"
+            f"Kittek №{optional_number(order['kittek_order_number'])}\n"
+            f"🔧 ID бота: {order['id']}\n"
             f"👤 {order['client_name']}\n"
             f"📍 {order['delivery_address']}\n"
             f"🕐 {order['delivery_time']}\n\n"
@@ -9799,8 +10047,8 @@ async def courier_full_queue(
         buttons.append([
             InlineKeyboardButton(
                 text=(
-                    f"{prefix} Заказ "
-                    f"№{order['id']}"
+                    f"{prefix} Kittek "
+                    f"№{optional_number(order['kittek_order_number'])}"
                 ),
                 callback_data=(
                     f"courier_queue_order:"
@@ -11520,266 +11768,466 @@ async def admin_home(
 # АДМИН — СТАТИСТИКА
 # =========================================================
 
-# =========================================================
-# АДМИН — СТАТИСТИКА ПО ДАТЕ СОБЫТИЯ
-# =========================================================
-
-def stats_period_keyboard():
+def stats_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📅 Сегодня", callback_data="stats_today"),
-            InlineKeyboardButton(text="📅 Вчера", callback_data="stats_yesterday"),
-        ],
-        [InlineKeyboardButton(text="📅 Выбрать дату", callback_data="stats_date")],
-        [InlineKeyboardButton(text="📅 Выбрать период", callback_data="stats_period")],
-        [InlineKeyboardButton(text="📋 Отчёт по курьерам", callback_data="stats_couriers")],
+        [InlineKeyboardButton(text="📅 Сегодня", callback_data="stats_today")],
+        [InlineKeyboardButton(text="🗓 Выбрать дату", callback_data="stats_date")],
+        [InlineKeyboardButton(text="📆 Период", callback_data="stats_period")],
     ])
 
-
-def local_day_bounds(day):
-    start = datetime(day.year, day.month, day.day, tzinfo=LOCAL_TZ)
-    return start, start + timedelta(days=1)
-
-
-async def calculate_event_stats(start_local, end_local):
+async def fetch_statistics(start, finish):
     async with db_pool.acquire() as conn:
         created = await conn.fetchval(
             """
-            SELECT COUNT(*) FROM orders
+            SELECT COUNT(*)
+            FROM orders
             WHERE created_at >= $1 AND created_at < $2
-            """, start_local, end_local)
-        event_rows = await conn.fetch(
+            """,
+            start, finish,
+        )
+        events = await conn.fetchrow(
             """
-            SELECT status, COUNT(DISTINCT order_id) AS cnt
-            FROM order_status_history
-            WHERE created_at >= $1 AND created_at < $2
-              AND status IN ('delivered','cancelled','postponed','problem')
-            GROUP BY status
-            """, start_local, end_local)
-        delivered_sum = await conn.fetchval(
+            SELECT
+                COUNT(DISTINCT order_id) FILTER (WHERE status = 'delivered')::int AS delivered,
+                COUNT(DISTINCT order_id) FILTER (WHERE status = 'cancelled')::int AS cancelled,
+                COUNT(*) FILTER (WHERE status = 'postponed')::int AS postponed_events,
+                COUNT(DISTINCT order_id) FILTER (WHERE status = 'problem')::int AS problem_events,
+                COALESCE((
+                    SELECT SUM(o2.delivery_price)
+                    FROM orders o2
+                    WHERE o2.id IN (
+                        SELECT DISTINCT h2.order_id
+                        FROM order_status_history h2
+                        WHERE h2.status = 'delivered'
+                          AND h2.created_at >= $1
+                          AND h2.created_at < $2
+                    )
+                ), 0) AS delivered_sum
+            FROM order_status_history h
+            WHERE h.created_at >= $1 AND h.created_at < $2
+            """,
+            start, finish,
+        )
+        unresolved = await conn.fetchval(
             """
-            SELECT COALESCE(SUM(o.delivery_price),0)
-            FROM orders o
-            JOIN order_status_history h ON h.order_id=o.id
-            WHERE h.status='delivered'
-              AND h.created_at >= $1 AND h.created_at < $2
-            """, start_local, end_local)
-        total_involved = await conn.fetchval(
+            WITH latest AS (
+                SELECT DISTINCT ON (h.order_id)
+                    h.order_id,
+                    h.status
+                FROM order_status_history h
+                WHERE h.created_at < $1
+                ORDER BY h.order_id, h.created_at DESC, h.id DESC
+            )
+            SELECT COUNT(*)
+            FROM latest l
+            WHERE l.status NOT IN ('delivered', 'cancelled')
+              AND EXISTS (
+                  SELECT 1 FROM orders o
+                  WHERE o.id = l.order_id
+                    AND o.created_at < $1
+              )
+            """,
+            finish,
+        )
+        couriers = await conn.fetch(
             """
-            SELECT COUNT(DISTINCT order_id)
-            FROM order_status_history
-            WHERE created_at >= $1 AND created_at < $2
-            """, start_local, end_local)
-    counts={row['status']: int(row['cnt']) for row in event_rows}
-    return {
-        'created': int(created or 0),
-        'total_involved': int(total_involved or 0),
-        'delivered': counts.get('delivered',0),
-        'cancelled': counts.get('cancelled',0),
-        'postponed': counts.get('postponed',0),
-        'problems': counts.get('problem',0),
-        'delivered_sum': delivered_sum or 0,
-    }
+            SELECT
+                COALESCE(c.full_name, 'Не назначен') AS name,
+                COUNT(DISTINCT h.order_id)::int AS cnt
+            FROM order_status_history h
+            JOIN orders o ON o.id = h.order_id
+            LEFT JOIN couriers c
+                ON c.id = COALESCE(h.courier_id_at_event, o.courier_id)
+            WHERE h.status = 'delivered'
+              AND h.created_at >= $1
+              AND h.created_at < $2
+            GROUP BY COALESCE(c.full_name, 'Не назначен')
+            ORDER BY cnt DESC, name
+            """,
+            start, finish,
+        )
+        stores = await conn.fetch(
+            """
+            SELECT
+                s.store_name AS name,
+                COUNT(DISTINCT h.order_id)::int AS cnt
+            FROM order_status_history h
+            JOIN orders o ON o.id = h.order_id
+            JOIN stores s ON s.id = o.store_id
+            WHERE h.status = 'delivered'
+              AND h.created_at >= $1
+              AND h.created_at < $2
+            GROUP BY s.store_name
+            ORDER BY cnt DESC, name
+            """,
+            start, finish,
+        )
+    return created, events, unresolved, couriers, stores
 
 
-async def send_stats_report(message, start_local, end_local, label):
-    stats = await calculate_event_stats(start_local, end_local)
-    await message.answer(
-        f"📊 СТАТИСТИКА — {label}\n\n"
-        f"🆕 Создано: {stats['created']}\n"
-        f"📦 Затронуто заказов по событиям: {stats['total_involved']}\n"
-        f"✅ Доставлено: {stats['delivered']}\n"
-        f"❌ Отменено: {stats['cancelled']}\n"
-        f"🗓 Перенесено: {stats['postponed']}\n"
-        f"⚠️ Проблем: {stats['problems']}\n"
-        f"💰 Сумма доставленных: {price_text(stats['delivered_sum'])}",
-        reply_markup=admin_keyboard,
+async def build_period_statistics(start, finish):
+    created, events, unresolved, couriers, stores = await fetch_statistics(start, finish)
+    end_inclusive = finish - timedelta(days=1)
+    text = (
+        f"📆 СТАТИСТИКА — {start.strftime('%d.%m.%Y')} — {end_inclusive.strftime('%d.%m.%Y')}\n\n"
+        f"📦 Создано заказов: {int(created or 0)}\n"
+        f"✅ Доставлено: {int(events['delivered'] or 0)}\n"
+        f"❌ Отменено: {int(events['cancelled'] or 0)}\n"
+        f"🗓 Переносов: {int(events['postponed_events'] or 0)}\n"
+        f"⚠️ Заказов с проблемой: {int(events['problem_events'] or 0)}\n"
+        f"⏳ Незавершённых на конец периода: {int(unresolved or 0)}\n"
+        f"💰 Сумма доставок: {price_text(events['delivered_sum'])}"
     )
+    if couriers:
+        text += "\n\n🚚 Доставлено по курьерам:\n" + "\n".join(
+            f"• {r['name']} — {r['cnt']}" for r in couriers
+        )
+    if stores:
+        text += "\n\n🏪 Доставлено по магазинам:\n" + "\n".join(
+            f"• {r['name']} — {r['cnt']}" for r in stores
+        )
+    return text, stats_period_keyboard(start, finish)
 
+
+async def build_daily_statistics(day):
+    start = datetime(day.year, day.month, day.day, tzinfo=LOCAL_TZ)
+    finish = start + timedelta(days=1)
+    created, events, unresolved, couriers, stores = await fetch_statistics(start, finish)
+
+    text = (
+        f"📊 СТАТИСТИКА — {start.strftime('%d.%m.%Y')}\n\n"
+        f"📦 Создано заказов: {int(created or 0)}\n"
+        f"✅ Доставлено: {int(events['delivered'] or 0)}\n"
+        f"❌ Отменено: {int(events['cancelled'] or 0)}\n"
+        f"🗓 Переносов: {int(events['postponed_events'] or 0)}\n"
+        f"⚠️ Заказов с проблемой: {int(events['problem_events'] or 0)}\n"
+        f"⏳ Незавершённых на конец дня: {int(unresolved or 0)}\n"
+        f"💰 Сумма доставок: {price_text(events['delivered_sum'])}"
+    )
+    if couriers:
+        text += "\n\n🚚 Доставлено по курьерам:\n" + "\n".join(
+            f"• {r['name']} — {r['cnt']}" for r in couriers
+        )
+    if stores:
+        text += "\n\n🏪 Доставлено по магазинам:\n" + "\n".join(
+            f"• {r['name']} — {r['cnt']}" for r in stores
+        )
+    return text, stats_day_keyboard(start)
 
 @dp.message(F.text == "📊 Статистика")
 async def admin_statistics(message: Message):
     if await deny_admin_message(message):
         return
-    await message.answer("📊 Выберите период:", reply_markup=stats_period_keyboard())
+    await message.answer(
+        "📊 СТАТИСТИКА\n\nВыберите режим:",
+        reply_markup=stats_menu_keyboard(),
+    )
 
+@dp.callback_query(F.data == "stats_menu")
+async def stats_menu(callback: CallbackQuery):
+    if await deny_admin_callback(callback):
+        return
+    await callback.message.answer(
+        "📊 Выберите режим:",
+        reply_markup=stats_menu_keyboard(),
+    )
+    await callback.answer()
 
 @dp.callback_query(F.data == "stats_today")
 async def stats_today(callback: CallbackQuery):
-    if await deny_admin_callback(callback): return
-    start,end=local_day_bounds(datetime.now(LOCAL_TZ).date())
-    await send_stats_report(callback.message,start,end,"Сегодня")
+    if await deny_admin_callback(callback):
+        return
+    try:
+        text, kb = await build_daily_statistics(datetime.now(LOCAL_TZ))
+    except Exception as error:
+        print("STATS TODAY ERROR:", repr(error))
+        await callback.answer("Ошибка статистики. Подробности записаны в лог.", show_alert=True)
+        return
+    await callback.message.answer(text, reply_markup=kb)
     await callback.answer()
-
-
-@dp.callback_query(F.data == "stats_yesterday")
-async def stats_yesterday(callback: CallbackQuery):
-    if await deny_admin_callback(callback): return
-    day=datetime.now(LOCAL_TZ).date()-timedelta(days=1)
-    start,end=local_day_bounds(day)
-    await send_stats_report(callback.message,start,end,"Вчера")
-    await callback.answer()
-
 
 @dp.callback_query(F.data == "stats_date")
-async def stats_date_start(callback: CallbackQuery,state:FSMContext):
-    if await deny_admin_callback(callback): return
-    await state.set_state(AdminStatistics.date_start)
-    await callback.message.answer("Введите дату в формате ДД.ММ.ГГГГ")
-    await callback.answer()
-
-
-@dp.message(AdminStatistics.date_start)
-async def stats_date_save(message:Message,state:FSMContext):
-    try: day=datetime.strptime(message.text.strip(),"%d.%m.%Y").date()
-    except ValueError:
-        await message.answer("❌ Формат: ДД.ММ.ГГГГ")
+async def stats_date(callback: CallbackQuery, state: FSMContext):
+    if await deny_admin_callback(callback):
         return
-    await state.clear()
-    start,end=local_day_bounds(day)
-    await send_stats_report(message,start,end,day.strftime("%d.%m.%Y"))
-
+    await state.set_state(AdminStatistics.date_input)
+    await state.update_data(stats_mode='date')
+    await callback.message.answer(
+        "Введите дату: ДД.ММ.ГГГГ\nНапример: 10.09.2026"
+    )
+    await callback.answer()
 
 @dp.callback_query(F.data == "stats_period")
-async def stats_period_start(callback:CallbackQuery,state:FSMContext):
-    if await deny_admin_callback(callback): return
-    await state.set_state(AdminStatistics.period_start)
-    await callback.message.answer("Введите период: ДД.ММ.ГГГГ - ДД.ММ.ГГГГ")
+async def stats_period(callback: CallbackQuery, state: FSMContext):
+    if await deny_admin_callback(callback):
+        return
+    await state.set_state(AdminStatistics.date_input)
+    await state.update_data(stats_mode='period')
+    await callback.message.answer(
+        "Введите период: ДД.ММ.ГГГГ-ДД.ММ.ГГГГ"
+    )
     await callback.answer()
 
+@dp.message(AdminStatistics.date_input)
+async def stats_date_input(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
 
-@dp.message(AdminStatistics.period_start)
-async def stats_period_save(message:Message,state:FSMContext):
-    raw=message.text.replace(" ","")
-    left,right=raw.split("-")
+    data = await state.get_data()
+    raw = (message.text or '').strip()
+    mode = data.get('stats_mode')
+
     try:
-        d1=datetime.strptime(left,"%d.%m.%Y").date(); d2=datetime.strptime(right,"%d.%m.%Y").date()
-    except ValueError:
-        await message.answer("❌ Неверная дата.")
-        return
-    if d2<d1:
-        await message.answer("❌ Конец периода раньше начала.")
-        return
-    await state.clear()
-    start,_=local_day_bounds(d1); _,end=local_day_bounds(d2)
-    end=end+timedelta(days=0)
-    await send_stats_report(message,start,end,f"{d1.strftime('%d.%m.%Y')} — {d2.strftime('%d.%m.%Y')}")
-
-
-async def build_courier_report(start_local,end_local):
-    async with db_pool.acquire() as conn:
-        couriers=await conn.fetch("SELECT id, full_name FROM couriers WHERE status='approved' ORDER BY full_name")
-        result=[]
-        for courier in couriers:
-            rows=await conn.fetch(
-                """
-                WITH delivered AS (
-                    SELECT DISTINCT ON (h.order_id)
-                        h.order_id, h.created_at AS delivered_at
-                    FROM order_status_history h
-                    WHERE h.status='delivered'
-                      AND h.created_at >= $1 AND h.created_at < $2
-                    ORDER BY h.order_id, h.created_at DESC
-                )
-                SELECT o.id,o.kittek_order_number,o.delivery_address,d.delivered_at,
-                       COALESCE((SELECT qh.queue_position FROM courier_queue_history qh
-                                 WHERE qh.order_id=o.id AND qh.courier_id=$3
-                                   AND qh.recorded_at <= d.delivered_at
-                                 ORDER BY qh.recorded_at DESC LIMIT 1), o.queue_position, 2147483647) AS report_position
-                FROM delivered d JOIN orders o ON o.id=d.order_id
-                WHERE o.courier_id=$3
-                ORDER BY report_position, d.delivered_at, o.id
-                """,start_local,end_local,courier['id'])
-            result.append((courier,rows))
-    return result
-
-
-async def send_courier_reports(message,start_local,end_local,label):
-    reports=await build_courier_report(start_local,end_local)
-    for courier,rows in reports:
-        text=f"📋 ОТЧЁТ ПО КУРЬЕРУ\n\n🚚 {courier['full_name']}\n🗓 {label}\n\n"
-        if not rows:
-            text += "Заказов за период нет."
+        if mode == 'period':
+            start, finish = parse_user_period(raw)
+            text, kb = await build_period_statistics(start, finish)
         else:
-            chunks=[]
-            for row in rows:
-                kittek=optional_number(row['kittek_order_number'])
-                chunks.append(f"{kittek}\n{row['delivery_address']}")
-            text += "\n\n".join(chunks)
-        await message.answer(text)
+            day = parse_user_date(raw)
+            text, kb = await build_daily_statistics(day)
+    except ValueError:
+        await message.answer(
+            "❌ Неверный формат. Используйте:\n"
+            "ДД.ММ.ГГГГ\n"
+            "или\n"
+            "ДД.ММ.ГГГГ-ДД.ММ.ГГГГ"
+        )
+        return
+    except Exception as error:
+        print("STATS DATE/PERIOD ERROR:", repr(error))
+        await state.clear()
+        await message.answer(
+            "⚠️ Дата распознана, но статистику не удалось загрузить. "
+            "Проверьте журнал Railway."
+        )
+        return
 
+    await state.clear()
+    await message.answer(text, reply_markup=kb)
 
-@dp.message(F.text == "📋 Отчёт по курьерам")
-async def courier_report_menu(message:Message):
-    if await deny_admin_message(message): return
-    await message.answer(
-        "📋 Выберите период отчёта:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📅 Сегодня", callback_data="courier_report_today")],
-            [InlineKeyboardButton(text="📅 Выбрать дату", callback_data="courier_report_date")],
-            [InlineKeyboardButton(text="📅 Выбрать период", callback_data="courier_report_period")],
-        ])
+async def send_stats_orders(message, day_text, search=None):
+    day = datetime.strptime(day_text, '%Y-%m-%d').replace(tzinfo=LOCAL_TZ)
+    finish = day + timedelta(days=1)
+    query = (search or '').strip() or None
+    pattern = None if not query else f"%{query}%"
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            WITH day_events AS (
+                SELECT h.order_id, MAX(h.created_at) AS event_at
+                FROM order_status_history h
+                WHERE h.created_at >= $1 AND h.created_at < $2
+                GROUP BY h.order_id
+                UNION
+                SELECT o.id, o.created_at
+                FROM orders o
+                WHERE o.created_at >= $1 AND o.created_at < $2
+            )
+            SELECT DISTINCT ON (o.id)
+                o.id,
+                o.kittek_order_number,
+                o.client_name,
+                o.status,
+                o.delivery_address,
+                s.store_name,
+                COALESCE(c.full_name, 'Не назначен') AS courier_name,
+                e.event_at
+            FROM day_events e
+            JOIN orders o ON o.id = e.order_id
+            JOIN stores s ON s.id = o.store_id
+            LEFT JOIN couriers c ON c.id = o.courier_id
+            WHERE (
+                $3::text IS NULL
+                OR o.kittek_order_number ILIKE $3
+                OR o.id::text ILIKE $3
+                OR c.full_name ILIKE $3
+                OR s.store_name ILIKE $3
+                OR o.client_name ILIKE $3
+                OR o.delivery_address ILIKE $3
+            )
+            ORDER BY o.id, e.event_at DESC
+            """,
+            day, finish, pattern,
+        )
+
+    rows = sorted(
+        rows,
+        key=lambda r: (
+            0 if query and str(r['kittek_order_number'] or '').strip().lower() == query.lower() else 1,
+            r['event_at'] or datetime.min.replace(tzinfo=LOCAL_TZ),
+            r['id'],
+        ),
     )
 
-
-@dp.callback_query(F.data == "stats_couriers")
-async def courier_report_today_from_stats(callback:CallbackQuery):
-    if await deny_admin_callback(callback): return
-    start,end=local_day_bounds(datetime.now(LOCAL_TZ).date())
-    await send_courier_reports(callback.message,start,end,"Сегодня")
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "courier_report_today")
-async def courier_report_today(callback:CallbackQuery):
-    if await deny_admin_callback(callback): return
-    start,end=local_day_bounds(datetime.now(LOCAL_TZ).date())
-    await send_courier_reports(callback.message,start,end,"Сегодня")
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "courier_report_date")
-async def courier_report_date_start(callback:CallbackQuery,state:FSMContext):
-    if await deny_admin_callback(callback): return
-    await state.set_state(AdminStatistics.courier_date)
-    await callback.message.answer("Введите дату отчёта: ДД.ММ.ГГГГ")
-    await callback.answer()
-
-
-@dp.message(AdminStatistics.courier_date)
-async def courier_report_date_save(message:Message,state:FSMContext):
-    try: day=datetime.strptime(message.text.strip(),"%d.%m.%Y").date()
-    except ValueError:
-        await message.answer("❌ Формат: ДД.ММ.ГГГГ")
+    if not rows:
+        await message.answer("Заказы не найдены.")
         return
+
+    for r in rows[:100]:
+        local_event = r['event_at'].astimezone(LOCAL_TZ) if r['event_at'] else None
+        event_text = local_event.strftime('%d.%m.%Y %H:%M') if local_event else '—'
+        await message.answer(
+            f"📦 Kittek №{optional_number(r['kittek_order_number'])}\n"
+            f"🔧 ID бота: {r['id']}\n"
+            f"🏪 {r['store_name']}\n"
+            f"👤 {r['client_name']}\n"
+            f"🚚 {r['courier_name']}\n"
+            f"📍 {r['delivery_address']}\n"
+            f"🕐 Событие: {event_text}\n"
+            f"{STATUS_NAMES.get(r['status'], r['status'])}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="Открыть заказ",
+                    callback_data=f"stats_open:{r['id']}",
+                )
+            ]]),
+        )
+
+async def send_courier_report(message: Message, start, finish):
+    """One separate message per courier, with delivered orders in historical queue order."""
+    async with db_pool.acquire() as conn:
+        couriers = await conn.fetch(
+            """
+            SELECT id, full_name
+            FROM couriers
+            WHERE status IN ('approved', 'deleted')
+            ORDER BY full_name, id
+            """
+        )
+        rows = await conn.fetch(
+            """
+            WITH delivered AS (
+                SELECT DISTINCT ON (h.order_id)
+                    h.order_id,
+                    h.created_at AS delivered_at,
+                    h.courier_id_at_event,
+                    h.queue_position_at_event
+                FROM order_status_history h
+                WHERE h.status = 'delivered'
+                  AND h.created_at >= $1
+                  AND h.created_at < $2
+                ORDER BY h.order_id, h.created_at DESC, h.id DESC
+            )
+            SELECT
+                o.id,
+                o.kittek_order_number,
+                o.delivery_address,
+                d.delivered_at,
+                COALESCE(d.courier_id_at_event, o.courier_id) AS courier_id,
+                COALESCE(c.full_name, 'Не назначен') AS courier_name,
+                d.queue_position_at_event
+            FROM delivered d
+            JOIN orders o ON o.id = d.order_id
+            LEFT JOIN couriers c
+                ON c.id = COALESCE(d.courier_id_at_event, o.courier_id)
+            ORDER BY
+                COALESCE(d.courier_id_at_event, o.courier_id),
+                COALESCE(d.queue_position_at_event, 2147483647),
+                d.delivered_at,
+                o.id
+            """,
+            start, finish,
+        )
+
+    end_inclusive = finish - timedelta(days=1)
+    period_label = (
+        start.strftime('%d.%m.%Y')
+        if start.date() == end_inclusive.date()
+        else f"{start.strftime('%d.%m.%Y')} — {end_inclusive.strftime('%d.%m.%Y')}"
+    )
+
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row['courier_id'], []).append(row)
+
+    # Include every active/historical courier, even when they delivered zero orders.
+    courier_map = {row['id']: row['full_name'] for row in couriers}
+    for row in rows:
+        if row['courier_id'] is not None and row['courier_id'] not in courier_map:
+            courier_map[row['courier_id']] = row['courier_name']
+
+    if not courier_map:
+        await message.answer(
+            f"📋 ОТЧЁТ ПО КУРЬЕРАМ\n📅 {period_label}\n\n"
+            "Курьеров для отчёта нет."
+        )
+        return
+
+    for courier_id, courier_name in sorted(courier_map.items(), key=lambda x: (str(x[1]).lower(), x[0])):
+        courier_rows = grouped.get(courier_id, [])
+        lines = [
+            "📋 ОТЧЁТ ПО КУРЬЕРУ",
+            f"🚚 {courier_name}",
+            f"📅 {period_label}",
+            f"📦 Заказов: {len(courier_rows)}",
+            "",
+        ]
+        for index, row in enumerate(courier_rows, start=1):
+            if EASTER_EGGS_ENABLED and index == len(courier_rows) and courier_rows and random.random() < 0.18:
+                lines.append(random.choice(COURIER_LAST_BEFORE_EGGS).format(name=courier_name))
+            lines.append(
+                f"{index}. Kittek №{optional_number(row['kittek_order_number'])}\n"
+                f"📍 {row['delivery_address']}"
+            )
+        if courier_rows and EASTER_EGGS_ENABLED and random.random() < 0.18:
+            lines.append(random.choice(COURIER_LAST_AFTER_EGGS).format(name=courier_name))
+        if courier_rows and EASTER_EGGS_ENABLED and random.random() < 0.12:
+            lines.insert(5, random.choice(COURIER_PRAISE_EGGS).format(name=courier_name))
+        await message.answer("\n\n".join(lines))
+
+
+@dp.callback_query(F.data.startswith("stats_orders:"))
+async def stats_orders(callback: CallbackQuery):
+    if await deny_admin_callback(callback):
+        return
+    await send_stats_orders(callback.message, callback.data.split(':', 1)[1])
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("stats_open:"))
+async def stats_open_order(callback: CallbackQuery):
+    if await deny_admin_callback(callback):
+        return
+    order_id = int(callback.data.split(":", 1)[1])
+    order = await get_order_full(order_id)
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    await callback.message.answer(
+        build_order_text(order),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="🕐 История",
+                callback_data=f"admin_history:{order_id}",
+            )
+        ]]),
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("stats_search:"))
+async def stats_search(callback: CallbackQuery, state: FSMContext):
+    if await deny_admin_callback(callback):
+        return
+    day = callback.data.split(':', 1)[1]
+    await state.set_state(AdminStatistics.search_input)
+    await state.update_data(stats_day=day)
+    await callback.message.answer(
+        "Введите Kittek, внутренний ID, имя курьера, магазин, клиента или адрес:"
+    )
+    await callback.answer()
+
+@dp.message(AdminStatistics.search_input)
+async def stats_search_input(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
     await state.clear()
-    start,end=local_day_bounds(day)
-    await send_courier_reports(message,start,end,day.strftime("%d.%m.%Y"))
-
-
-@dp.callback_query(F.data == "courier_report_period")
-async def courier_report_period_start(callback:CallbackQuery,state:FSMContext):
-    if await deny_admin_callback(callback): return
-    await state.set_state(AdminStatistics.courier_period)
-    await callback.message.answer("Введите период: ДД.ММ.ГГГГ - ДД.ММ.ГГГГ")
-    await callback.answer()
-
-
-@dp.message(AdminStatistics.courier_period)
-async def courier_report_period_save(message:Message,state:FSMContext):
-    raw=(message.text or "").replace(" ","")
-    try:
-        left,right=raw.split("-")
-        d1=datetime.strptime(left,"%d.%m.%Y").date(); d2=datetime.strptime(right,"%d.%m.%Y").date()
-    except (ValueError,TypeError):
-        await message.answer("❌ Формат: ДД.ММ.ГГГГ - ДД.ММ.ГГГГ")
-        return
-    if d2<d1:
-        await message.answer("❌ Конец периода раньше начала.")
-        return
-    await state.clear()
-    start,_=local_day_bounds(d1); _,end=local_day_bounds(d2)
-    await send_courier_reports(message,start,end,f"{d1.strftime('%d.%m.%Y')} — {d2.strftime('%d.%m.%Y')}")
+    await send_stats_orders(
+        message,
+        data['stats_day'],
+        (message.text or '').strip(),
+    )
 
 
 # =========================================================
@@ -11926,8 +12374,9 @@ async def admin_new_orders(
                 order,
 
                 title=(
-                    f"🆕 ЗАКАЗ №"
-                    f"{order['id']}"
+                    f"🆕 KITTEK №"
+                    f"{optional_number(order['kittek_order_number'])}"
+                    f"\n🔧 ID бота: {order['id']}"
                 ),
             ),
 
@@ -12058,10 +12507,6 @@ async def assign_order(
                 ),
             )
 
-            await record_courier_queue_snapshot(
-                conn, courier_id
-            )
-
     await callback.message.edit_reply_markup(
         reply_markup=None
     )
@@ -12092,169 +12537,59 @@ async def assign_order(
 # АДМИН — АКТИВНЫЕ
 # =========================================================
 
-@dp.message(
-    F.text == "🚚 Активные"
-)
-async def admin_active_orders(
-    message: Message
-):
+def admin_active_order_keyboard(order):
+    rows = []
+    if order["status"] == "problem":
+        rows.append([InlineKeyboardButton(text="▶️ Продолжить после проблемы", callback_data=f"problem_continue:{order['id']}")])
+    rows += [
+        [InlineKeyboardButton(text="🔄 Сменить курьера", callback_data=f"reassign_order:{order['id']}")],
+        [InlineKeyboardButton(text="💰 Стоимость", callback_data=f"set_price:{order['id']}")],
+        [InlineKeyboardButton(text="🕐 История", callback_data=f"admin_history:{order['id']}"), InlineKeyboardButton(text="📸 Фото", callback_data=f"admin_photos:{order['id']}")],
+        [InlineKeyboardButton(text="🗓 Перенести", callback_data=f"admin_reschedule:{order['id']}")],
+        [InlineKeyboardButton(text="✅ Завершить вручную", callback_data=f"admin_complete:{order['id']}")],
+        [InlineKeyboardButton(text="❌ Отменить заказ", callback_data=f"cancel_order_admin:{order['id']}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    if await deny_admin_message(
-        message
-    ):
-        return
-
+async def send_admin_active_couriers(target_message):
     async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT c.id, c.full_name, COUNT(o.id)::int AS order_count
+            FROM couriers c JOIN orders o ON o.courier_id=c.id
+            WHERE o.status = ANY($1::text[])
+            GROUP BY c.id,c.full_name ORDER BY c.full_name
+        """, list(QUEUE_ACTIVE_STATUSES))
+    if not rows:
+        await target_message.answer("🚚 Активных заказов нет.", reply_markup=admin_keyboard); return
+    kb=[[InlineKeyboardButton(text=f"{r['full_name']} — {r['order_count']} заказ(а)", callback_data=f"active_courier:{r['id']}")] for r in rows]
+    await target_message.answer("🚚 АКТИВНЫЕ ЗАКАЗЫ\n\nВыберите курьера:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-        orders = await conn.fetch(
-            """
-            SELECT
-                o.*,
+@dp.message(F.text == "🚚 Активные")
+async def admin_active_orders(message: Message):
+    if await deny_admin_message(message): return
+    await send_admin_active_couriers(message)
 
-                s.store_name,
-
-                c.full_name
-                    AS courier_name,
-
-                c.phone
-                    AS courier_phone,
-
-                c.vehicle
-                    AS courier_vehicle,
-
-                su.full_name
-                    AS created_by
-
-            FROM orders o
-
-            JOIN stores s
-                ON s.id = o.store_id
-
-            LEFT JOIN couriers c
-                ON c.id = o.courier_id
-
-            LEFT JOIN store_users su
-                ON su.telegram_id =
-                   o.created_by_telegram_id
-
-            WHERE o.status NOT IN (
-                'new',
-                'postponed',
-                'delivered',
-                'cancelled'
-            )
-
-            ORDER BY o.id DESC
-            """
-        )
-
-    if not orders:
-
-        await message.answer(
-            "🚚 Активных заказов нет.",
-
-            reply_markup=admin_keyboard,
-        )
-
-        return
-
+@dp.callback_query(F.data.startswith("active_courier:"))
+async def admin_active_courier_orders(callback: CallbackQuery):
+    if await deny_admin_callback(callback): return
+    courier_id=int(callback.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        courier=await conn.fetchrow("SELECT full_name FROM couriers WHERE id=$1", courier_id)
+        orders=await conn.fetch("""
+            SELECT o.*,s.store_name,c.full_name AS courier_name,c.phone AS courier_phone,c.vehicle AS courier_vehicle,c.telegram_id AS courier_telegram_id,su.full_name AS created_by
+            FROM orders o JOIN stores s ON s.id=o.store_id LEFT JOIN couriers c ON c.id=o.courier_id LEFT JOIN store_users su ON su.telegram_id=o.created_by_telegram_id
+            WHERE o.courier_id=$1 AND o.status = ANY($2::text[]) ORDER BY COALESCE(o.queue_position,2147483647),o.id
+        """,courier_id,list(QUEUE_ACTIVE_STATUSES))
+    await callback.message.answer(f"🚚 {courier['full_name'] if courier else 'Курьер'} — {len(orders)} заказ(а)")
     for order in orders:
+        await callback.message.answer(build_order_text(order,title=f"🚚 KITTEK №{optional_number(order['kittek_order_number'])}\n🔧 ID бота: {order['id']}"),reply_markup=admin_active_order_keyboard(order))
+    await callback.message.answer("↩️ Вернуться к списку курьеров", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Назад к курьерам",callback_data="active_couriers_back")]]))
+    await callback.answer()
 
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="🔄 Сменить курьера",
-                        callback_data=(
-                            f"reassign_order:"
-                            f"{order['id']}"
-                        ),
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="💰 Стоимость",
-                        callback_data=(
-                            f"set_price:"
-                            f"{order['id']}"
-                        ),
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="🕐 История",
-                        callback_data=(
-                            f"admin_history:"
-                            f"{order['id']}"
-                        ),
-                    ),
-
-                    InlineKeyboardButton(
-                        text="📸 Фото",
-                        callback_data=(
-                            f"admin_photos:"
-                            f"{order['id']}"
-                        ),
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="🗓 Перенести",
-                        callback_data=(
-                            f"admin_reschedule:"
-                            f"{order['id']}"
-                        ),
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="✅ Завершить вручную",
-                        callback_data=(
-                            f"admin_complete:"
-                            f"{order['id']}"
-                        ),
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="❌ Отменить заказ",
-                        callback_data=(
-                            f"cancel_order_admin:"
-                            f"{order['id']}"
-                        ),
-                    )
-                ],
-            ]
-        )
-
-        if order["status"] == "problem":
-
-            keyboard.inline_keyboard.insert(
-                0,
-                [
-                    InlineKeyboardButton(
-                        text="▶️ Продолжить после проблемы",
-                        callback_data=(
-                            f"problem_continue:"
-                            f"{order['id']}"
-                        ),
-                    )
-                ],
-            )
-
-        await message.answer(
-            build_order_text(
-                order,
-
-                title=(
-                    f"🚚 ЗАКАЗ №"
-                    f"{order['id']}"
-                ),
-            ),
-
-            reply_markup=keyboard,
-        )
-
+@dp.callback_query(F.data == "active_couriers_back")
+async def admin_active_couriers_back(callback: CallbackQuery):
+    if await deny_admin_callback(callback): return
+    await send_admin_active_couriers(callback.message); await callback.answer()
 
 
 # =========================================================
@@ -12290,6 +12625,9 @@ async def admin_delivered_orders(
 
                 c.vehicle
                     AS courier_vehicle,
+
+                c.telegram_id
+                    AS courier_telegram_id,
 
                 su.full_name
                     AS created_by
@@ -12360,8 +12698,9 @@ async def admin_delivered_orders(
                 order,
 
                 title=(
-                    f"✅ ЗАКАЗ №"
-                    f"{order['id']}"
+                    f"✅ KITTEK №"
+                    f"{optional_number(order['kittek_order_number'])}"
+                    f"\n🔧 ID бота: {order['id']}"
                 ),
             ),
 
@@ -12391,8 +12730,9 @@ async def admin_search_start(
     )
 
     await message.answer(
-        "🔎 Введите номер заказа.\n\n"
-        "Например: 15"
+        "🔎 Введите номер заказа по Kittek.\n\n"
+        "Внутренний ID бота тоже поддерживается как запасной вариант.\n"
+        "Например: 123456 или 303"
     )
 
 
@@ -12403,162 +12743,39 @@ async def admin_search_order(
     message: Message,
     state: FSMContext,
 ):
-
-    if not is_admin(
-        message.from_user.id
-    ):
-
+    if not is_admin(message.from_user.id):
         await state.clear()
-
         return
 
-    value = (message.text or "").strip()
-    if not value:
-        await message.answer("❌ Введите Kittek № или внутренний ID заказа.")
+    query = (message.text or "").strip()
+    if not query:
+        await message.answer("❌ Введите номер Kittek или внутренний ID заказа.")
         return
 
     await state.clear()
-
-    order = None
-    try:
-        order_id = int(value)
-    except ValueError:
-        order_id = None
-
     async with db_pool.acquire() as conn:
         order = await conn.fetchrow(
             """
             SELECT o.*, s.store_name, c.full_name AS courier_name,
                    c.phone AS courier_phone, c.vehicle AS courier_vehicle,
-                   su.full_name AS created_by
+                   c.telegram_id AS courier_telegram_id, su.full_name AS created_by
             FROM orders o
-            JOIN stores s ON s.id=o.store_id
-            LEFT JOIN couriers c ON c.id=o.courier_id
-            LEFT JOIN store_users su ON su.telegram_id=o.created_by_telegram_id
-            WHERE o.kittek_order_number = $1
-            ORDER BY o.id DESC
+            JOIN stores s ON s.id = o.store_id
+            LEFT JOIN couriers c ON c.id = o.courier_id
+            LEFT JOIN store_users su ON su.telegram_id = o.created_by_telegram_id
+            WHERE o.kittek_order_number = $1 OR o.id::text = $1
+            ORDER BY CASE WHEN o.kittek_order_number = $1 THEN 0 ELSE 1 END, o.id DESC
             LIMIT 1
-            """, value
+            """, query,
         )
-        if not order and order_id is not None:
-            order = await conn.fetchrow(
-                """
-                SELECT o.*, s.store_name, c.full_name AS courier_name,
-                       c.phone AS courier_phone, c.vehicle AS courier_vehicle,
-                       su.full_name AS created_by
-                FROM orders o
-                JOIN stores s ON s.id=o.store_id
-                LEFT JOIN couriers c ON c.id=o.courier_id
-                LEFT JOIN store_users su ON su.telegram_id=o.created_by_telegram_id
-                WHERE o.id=$1
-                """, order_id
-            )
 
     if not order:
-        await message.answer(f"❌ Заказ с Kittek № или ID «{value}» не найден.")
+        await message.answer(f"❌ Заказ по Kittek/ID «{query}» не найден.")
         return
 
-    order_id = order["id"]
-
-    buttons = [
-        [
-            InlineKeyboardButton(
-                text="🕐 История",
-                callback_data=(
-                    f"admin_history:"
-                    f"{order_id}"
-                ),
-            ),
-
-            InlineKeyboardButton(
-                text="📸 Фото",
-                callback_data=(
-                    f"admin_photos:"
-                    f"{order_id}"
-                ),
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text="💰 Стоимость",
-                callback_data=(
-                    f"set_price:"
-                    f"{order_id}"
-                ),
-            )
-        ],
-    ]
-
-    if order["status"] not in (
-        "delivered",
-        "cancelled",
-    ):
-
-        if order["status"] == "problem":
-
-            buttons.append([
-                InlineKeyboardButton(
-                    text="▶️ Продолжить после проблемы",
-                    callback_data=(
-                        f"problem_continue:"
-                        f"{order_id}"
-                    ),
-                )
-            ])
-
-        if order["status"] not in (
-            "new",
-            "postponed",
-        ):
-
-            buttons.append([
-                InlineKeyboardButton(
-                    text="🔄 Сменить курьера",
-                    callback_data=(
-                        f"reassign_order:"
-                        f"{order_id}"
-                    ),
-                )
-            ])
-
-        buttons.append([
-            InlineKeyboardButton(
-                text="🗓 Перенести",
-                callback_data=(
-                    f"admin_reschedule:"
-                    f"{order_id}"
-                ),
-            )
-        ])
-
-        buttons.append([
-            InlineKeyboardButton(
-                text="✅ Завершить вручную",
-                callback_data=(
-                    f"admin_complete:"
-                    f"{order_id}"
-                ),
-            )
-        ])
-
-        buttons.append([
-            InlineKeyboardButton(
-                text="❌ Отменить заказ",
-                callback_data=(
-                    f"cancel_order_admin:"
-                    f"{order_id}"
-                ),
-            )
-        ])
-
     await message.answer(
-        build_order_text(
-            order
-        ),
-
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        ),
+        build_order_text(order, title=f"📦 Kittek №{optional_number(order['kittek_order_number'])}\n🔧 ID бота: {order['id']}"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🕐 История", callback_data=f"admin_history:{order['id']}")]])
     )
 
 
@@ -12614,16 +12831,18 @@ async def admin_history(
 
         return
 
+    order = await get_order_full(order_id)
     text = (
-        f"🕐 ИСТОРИЯ ЗАКАЗА №"
-        f"{order_id}\n\n"
+        f"🕐 ИСТОРИЯ ЗАКАЗА\n"
+        f"🔢 Kittek №: {optional_number(order['kittek_order_number']) if order else '—'}\n"
+        f"🔧 ID бота: {order_id}\n\n"
     )
 
     for row in history:
 
-        created_at = row["created_at"]
-        local_time = created_at.astimezone(LOCAL_TZ) if created_at else None
-        time_text = local_time.strftime("%d.%m.%Y %H:%M") if local_time else "-"
+        time_text = (
+            row["created_at"].astimezone(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+        )
 
         text += (
             f"{STATUS_NAMES.get(row['status'], row['status'])}\n"
@@ -13001,7 +13220,7 @@ async def perform_manual_admin_complete(
 
             order = await conn.fetchrow(
                 """
-                SELECT id, store_id, courier_id, status
+                SELECT id, store_id, courier_id, queue_position, status
                 FROM orders
                 WHERE id = $1
                 FOR UPDATE
@@ -13020,6 +13239,7 @@ async def perform_manual_admin_complete(
                 return None
 
             old_courier_id = order["courier_id"]
+            old_queue_position = order["queue_position"] if "queue_position" in order else None
 
             updated = await conn.fetchrow(
                 """
@@ -13045,6 +13265,8 @@ async def perform_manual_admin_complete(
                     "Администратор завершил заказ вручную. "
                     f"Причина: {reason_text}"
                 ),
+                courier_id_at_event=old_courier_id,
+                queue_position_at_event=old_queue_position,
             )
 
             if old_courier_id:
@@ -13922,34 +14144,6 @@ async def edit_admin_queue_message(
         return False
 
 
-async def record_courier_queue_snapshot(conn, courier_id: int):
-    rows = await conn.fetch(
-        """
-        SELECT id, queue_position
-        FROM orders
-        WHERE courier_id = $1
-          AND status = ANY($2::text[])
-        ORDER BY queue_position, id
-        """,
-        courier_id,
-        list(QUEUE_ACTIVE_STATUSES),
-    )
-    if not rows:
-        return
-    await conn.executemany(
-        """
-        INSERT INTO courier_queue_history
-            (courier_id, order_id, queue_position)
-        VALUES ($1,$2,$3)
-        """,
-        [
-            (courier_id, row["id"], row["queue_position"])
-            for row in rows
-            if row["queue_position"] is not None
-        ],
-    )
-
-
 async def build_courier_queue_view(
     courier_id: int,
 ):
@@ -14023,8 +14217,9 @@ async def build_courier_queue_view(
 
         text += (
             f"{order['queue_position']}️⃣ "
-            f"Заказ №{order['id']} — "
+            f"Kittek №{optional_number(order['kittek_order_number'])} — "
             f"{STATUS_NAMES.get(order['status'], order['status'])}\n"
+            f"🔧 ID бота: {order['id']}\n"
             f"🏪 {order['store_name']}\n"
             f"👤 {order['client_name']}\n"
             f"📍 {order['delivery_address']}\n\n"
@@ -14032,7 +14227,7 @@ async def build_courier_queue_view(
 
         buttons.append([
             InlineKeyboardButton(
-                text=f"🔝 №{order['id']}",
+                text=f"🔝 Kittek {optional_number(order['kittek_order_number'])}",
                 callback_data=(
                     f"queue_move:{courier_id}:"
                     f"{order['id']}:top"
@@ -14276,10 +14471,6 @@ async def admin_queue_move(
                     current_id,
                 )
 
-            await record_courier_queue_snapshot(
-                conn, courier_id
-            )
-
             await add_history(
                 conn,
                 order_id,
@@ -14294,6 +14485,14 @@ async def admin_queue_move(
                     f"{new_index + 1}"
                 ),
             )
+
+    # Queue positions changed for the whole courier queue, so refresh
+    # every existing live status card for that courier.
+    for changed_order_id in ids:
+        try:
+            await update_store_status_message(changed_order_id)
+        except Exception as error:
+            print("QUEUE STATUS REFRESH ERROR:", changed_order_id, error)
 
     # Queue management itself does not send extra
     # messages into the administrator's chat.
@@ -14405,7 +14604,7 @@ async def show_reschedule_menu(
                 InlineKeyboardButton(
                     text="🌅 На завтра, 09:00",
                     callback_data=(
-                        f"reschedule_tomorrow:"
+                        f"reschedule_24:"
                         f"{actor}:{order_id}"
                     ),
                 )
@@ -14521,9 +14720,9 @@ async def store_reschedule_start(
 
 
 @dp.callback_query(
-    F.data.startswith("reschedule_tomorrow:")
+    F.data.startswith("reschedule_24:")
 )
-async def reschedule_tomorrow(
+async def reschedule_24_hours(
     callback: CallbackQuery
 ):
 
@@ -14573,16 +14772,7 @@ async def reschedule_tomorrow(
 
             return
 
-    now_local = datetime.now(LOCAL_TZ)
-    tomorrow = (now_local + timedelta(days=1)).date()
-    scheduled_for = datetime(
-        tomorrow.year,
-        tomorrow.month,
-        tomorrow.day,
-        9,
-        0,
-        tzinfo=LOCAL_TZ,
-    )
+    scheduled_for = next_morning_09_local()
 
     result = await postpone_existing_order(
         order_id,
@@ -14590,7 +14780,7 @@ async def reschedule_tomorrow(
         actor,
         callback.from_user.id,
         (
-            "Заказ перенесён на следующий день, 09:00: "
+            "Заказ перенесён на завтрашнее утро: "
             f"{scheduled_for.strftime('%d.%m.%Y %H:%M')}"
         ),
     )
@@ -14610,7 +14800,7 @@ async def reschedule_tomorrow(
 
     await callback.message.answer(
         f"✅ Заказ №{order_id} перенесён.\n\n"
-        f"🗓 Повторная публикация: "
+        f"🗓 Завтра в 09:00: "
         f"{scheduled_for.strftime('%d.%m.%Y %H:%M')}"
     )
 
@@ -15443,105 +15633,59 @@ async def admin_stores(
     message: Message
 ):
 
-    if await deny_admin_message(
-        message
-    ):
+    if await deny_admin_message(message):
         return
 
     async with db_pool.acquire() as conn:
-
         stores = await conn.fetch(
             """
             SELECT
                 s.*,
-
-                COUNT(su.id)
-                    AS members_count
-
+                COUNT(su.id) FILTER (WHERE su.is_active = TRUE) AS members_count
             FROM stores s
-
             LEFT JOIN store_users su
                 ON su.store_id = s.id
-
+            WHERE s.status <> 'deleted'
             GROUP BY s.id
-
             ORDER BY
                 CASE
-                    WHEN s.status = 'pending'
-                    THEN 0
-
-                    WHEN s.status = 'approved'
-                    THEN 1
-
+                    WHEN s.status = 'pending' THEN 0
+                    WHEN s.status = 'approved' THEN 1
                     ELSE 2
                 END,
-
                 s.id DESC
             """
         )
 
     if not stores:
-
-        await message.answer(
-            "🏪 Магазинов пока нет."
-        )
-
+        await message.answer("🏪 Магазинов пока нет.")
         return
 
     for store in stores:
-
-        keyboard = None
-
+        rows = []
         if store["status"] == "pending":
-
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[[
-                    InlineKeyboardButton(
-                        text="✅ Одобрить",
-                        callback_data=(
-                            f"approve_store:"
-                            f"{store['id']}"
-                        ),
-                    ),
-
-                    InlineKeyboardButton(
-                        text="❌ Отклонить",
-                        callback_data=(
-                            f"reject_store:"
-                            f"{store['id']}"
-                        ),
-                    ),
-                ]]
-            )
+            rows.append([
+                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_store:{store['id']}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_store:{store['id']}"),
+            ])
+        rows.append([
+            InlineKeyboardButton(text="🗑 Удалить магазин", callback_data=f"delete_store:{store['id']}"),
+        ])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
 
         status = {
             "pending": "⏳ Ожидает",
             "approved": "✅ Одобрен",
             "rejected": "❌ Отклонён",
-        }.get(
-            store["status"],
-            store["status"],
-        )
+        }.get(store["status"], store["status"])
 
         await message.answer(
-            f"🏪 "
-            f"{store['store_name']}\n\n"
-
-            f"Статус: "
-            f"{status}\n"
-
-            f"👥 Пользователей: "
-            f"{store['members_count']}\n"
-
-            f"👤 Контакт: "
-            f"{store['contact_name']}\n"
-
-            f"📞 "
-            f"{store['phone']}\n"
-
-            f"📍 "
-            f"{store['address']}",
-
+            f"🏪 {store['store_name']}\n\n"
+            f"Статус: {status}\n"
+            f"👥 Пользователей: {store['members_count']}\n"
+            f"👤 Контакт: {store['contact_name']}\n"
+            f"📞 {store['phone']}\n"
+            f"📍 {store['address']}",
             reply_markup=keyboard,
         )
 
@@ -15557,92 +15701,250 @@ async def admin_couriers(
     message: Message
 ):
 
-    if await deny_admin_message(
-        message
-    ):
+    if await deny_admin_message(message):
         return
 
     async with db_pool.acquire() as conn:
-
         couriers = await conn.fetch(
             """
             SELECT *
-
             FROM couriers
-
+            WHERE status <> 'deleted'
             ORDER BY
                 CASE
-                    WHEN status = 'pending'
-                    THEN 0
-
-                    WHEN status = 'approved'
-                    THEN 1
-
+                    WHEN status = 'pending' THEN 0
+                    WHEN status = 'approved' THEN 1
                     ELSE 2
                 END,
-
                 id DESC
             """
         )
 
     if not couriers:
-
-        await message.answer(
-            "🚚 Курьеров пока нет."
-        )
-
+        await message.answer("🚚 Курьеров пока нет.")
         return
 
     for courier in couriers:
-
-        keyboard = None
-
+        rows = []
         if courier["status"] == "pending":
-
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[[
-                    InlineKeyboardButton(
-                        text="✅ Одобрить",
-                        callback_data=(
-                            f"approve_courier:"
-                            f"{courier['id']}"
-                        ),
-                    ),
-
-                    InlineKeyboardButton(
-                        text="❌ Отклонить",
-                        callback_data=(
-                            f"reject_courier:"
-                            f"{courier['id']}"
-                        ),
-                    ),
-                ]]
-            )
+            rows.append([
+                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_courier:{courier['id']}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_courier:{courier['id']}"),
+            ])
+        rows.append([
+            InlineKeyboardButton(text="🗑 Удалить курьера", callback_data=f"delete_courier:{courier['id']}"),
+        ])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
 
         status = {
             "pending": "⏳ Ожидает",
             "approved": "✅ Одобрен",
             "rejected": "❌ Отклонён",
-        }.get(
-            courier["status"],
-            courier["status"],
-        )
+        }.get(courier["status"], courier["status"])
 
         await message.answer(
-            f"🚚 "
-            f"{courier['full_name']}\n\n"
-
-            f"Статус: "
-            f"{status}\n"
-
-            f"📞 "
-            f"{courier['phone']}\n"
-
-            f"🚗 "
-            f"{courier['vehicle']}",
-
+            f"🚚 {courier['full_name']}\n\n"
+            f"Статус: {status}\n"
+            f"📞 {courier['phone']}\n"
+            f"🚗 {courier['vehicle']}",
             reply_markup=keyboard,
         )
+
+
+# =========================================================
+# УДАЛЕНИЕ КУРЬЕРОВ И МАГАЗИНОВ — МЯГКОЕ УДАЛЕНИЕ
+# =========================================================
+
+@dp.callback_query(F.data.startswith("delete_courier:"))
+async def delete_courier_confirm(callback: CallbackQuery):
+    if await deny_admin_callback(callback):
+        return
+
+    courier_id = int(callback.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        courier = await conn.fetchrow(
+            """
+            SELECT id, full_name, status
+            FROM couriers
+            WHERE id = $1 AND status <> 'deleted'
+            """,
+            courier_id,
+        )
+
+    if not courier:
+        await callback.answer("Курьер не найден.", show_alert=True)
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_delete_courier:{courier_id}")],
+        [InlineKeyboardButton(text="↩️ Отмена", callback_data="cancel_delete_entity")],
+    ])
+    await callback.message.answer(
+        "⚠️ УДАЛЕНИЕ КУРЬЕРА\n\n"
+        f"🚚 {courier['full_name']}\n\n"
+        "История завершённых заказов сохранится.\n"
+        "Если за курьером ещё числятся активные заказы, удаление будет заблокировано.\n\n"
+        "Удалить курьера?",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("confirm_delete_courier:"))
+async def confirm_delete_courier(callback: CallbackQuery):
+    if await deny_admin_callback(callback):
+        return
+
+    courier_id = int(callback.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            courier = await conn.fetchrow(
+                """
+                SELECT id, full_name
+                FROM couriers
+                WHERE id = $1 AND status <> 'deleted'
+                FOR UPDATE
+                """,
+                courier_id,
+            )
+            if not courier:
+                await callback.answer("Курьер уже удалён.", show_alert=True)
+                return
+
+            active_count = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM orders
+                WHERE courier_id = $1
+                  AND status = ANY($2::text[])
+                """,
+                courier_id,
+                list(QUEUE_ACTIVE_STATUSES),
+            )
+            if active_count:
+                await callback.answer(
+                    f"Нельзя удалить: у курьера {active_count} активных заказ(а). Сначала решите их.",
+                    show_alert=True,
+                )
+                return
+
+            await conn.execute(
+                """
+                UPDATE couriers
+                SET status = 'deleted'
+                WHERE id = $1
+                """,
+                courier_id,
+            )
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        f"🗑 Курьер {courier['full_name']} удалён из активного списка. История заказов сохранена."
+    )
+    await callback.answer("Курьер удалён.")
+
+
+@dp.callback_query(F.data.startswith("delete_store:"))
+async def delete_store_confirm(callback: CallbackQuery):
+    if await deny_admin_callback(callback):
+        return
+
+    store_id = int(callback.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        store = await conn.fetchrow(
+            """
+            SELECT id, store_name, status
+            FROM stores
+            WHERE id = $1 AND status <> 'deleted'
+            """,
+            store_id,
+        )
+    if not store:
+        await callback.answer("Магазин не найден.", show_alert=True)
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_delete_store:{store_id}")],
+        [InlineKeyboardButton(text="↩️ Отмена", callback_data="cancel_delete_entity")],
+    ])
+    await callback.message.answer(
+        "⚠️ УДАЛЕНИЕ МАГАЗИНА\n\n"
+        f"🏪 {store['store_name']}\n\n"
+        "Заказы, документы и история не будут удалены.\n"
+        "Если есть активные или отложенные заказы, удаление будет заблокировано, чтобы не оборвать доставку.\n\n"
+        "Удалить магазин?",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("confirm_delete_store:"))
+async def confirm_delete_store(callback: CallbackQuery):
+    if await deny_admin_callback(callback):
+        return
+
+    store_id = int(callback.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            store = await conn.fetchrow(
+                """
+                SELECT id, store_name
+                FROM stores
+                WHERE id = $1 AND status <> 'deleted'
+                FOR UPDATE
+                """,
+                store_id,
+            )
+            if not store:
+                await callback.answer("Магазин уже удалён.", show_alert=True)
+                return
+
+            active_count = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM orders
+                WHERE store_id = $1
+                  AND status NOT IN ('delivered','cancelled')
+                """,
+                store_id,
+            )
+            scheduled_count = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM scheduled_orders
+                WHERE store_id = $1
+                  AND status = 'scheduled'
+                """,
+                store_id,
+            )
+            if active_count or scheduled_count:
+                await callback.answer(
+                    f"Нельзя удалить: активных заказов {active_count}, отложенных {scheduled_count}.",
+                    show_alert=True,
+                )
+                return
+
+            await conn.execute(
+                """
+                UPDATE stores
+                SET status = 'deleted'
+                WHERE id = $1
+                """,
+                store_id,
+            )
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        f"🗑 Магазин {store['store_name']} удалён из активного списка. История заказов сохранена."
+    )
+    await callback.answer("Магазин удалён.")
+
+
+@dp.callback_query(F.data == "cancel_delete_entity")
+async def cancel_delete_entity(callback: CallbackQuery):
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Удаление отменено.")
+    await callback.answer()
 
 
 # =========================================================
@@ -15998,9 +16300,3 @@ if __name__ == "__main__":
     asyncio.run(
         main()
     )
-
-# Backward-compatible internal alias: old function name is retained so
-# external imports/tests referring to it do not break. The UI uses the
-# new calendar-day behaviour implemented by reschedule_tomorrow().
-async def reschedule_24_hours(callback: CallbackQuery):
-    return await reschedule_tomorrow(callback)
