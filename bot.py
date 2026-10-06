@@ -14177,6 +14177,7 @@ async def build_courier_queue_view(
             """
             SELECT
                 o.id,
+                o.kittek_order_number,
                 o.queue_position,
                 o.status,
                 o.client_name,
