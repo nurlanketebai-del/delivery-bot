@@ -15767,11 +15767,11 @@ async def admin_couriers(
 
         keyboard = None
 
-        if courier["status"] in ("pending", "rejected"):
+        if courier["status"] in ("pending", "rejected", "deleted"):
 
             approve_label = (
                 "♻️ Вернуть к работе"
-                if courier["status"] == "rejected"
+                if courier["status"] in ("rejected", "deleted")
                 else "✅ Одобрить"
             )
 
@@ -15799,6 +15799,7 @@ async def admin_couriers(
             "pending": "⏳ Ожидает",
             "approved": "✅ Одобрен",
             "rejected": "❌ Отклонён",
+            "deleted": "🗑 Удалён — можно восстановить",
         }.get(
             courier["status"],
             courier["status"],
