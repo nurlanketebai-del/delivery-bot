@@ -15767,12 +15767,18 @@ async def admin_couriers(
 
         keyboard = None
 
-        if courier["status"] == "pending":
+        if courier["status"] in ("pending", "rejected"):
+
+            approve_label = (
+                "♻️ Вернуть к работе"
+                if courier["status"] == "rejected"
+                else "✅ Одобрить"
+            )
 
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[[
                     InlineKeyboardButton(
-                        text="✅ Одобрить",
+                        text=approve_label,
                         callback_data=(
                             f"approve_courier:"
                             f"{courier['id']}"
