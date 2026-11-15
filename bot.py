@@ -1485,7 +1485,7 @@ title = (
         f"📦 ЗАКАЗ KITTEK №{order['kittek_order_number']}"
         if order.get("kittek_order_number")
         else f"📦 ЗАКАЗ №{order['id']}"
-    )
+        )
 
     courier_name = (
         order["courier_name"]
