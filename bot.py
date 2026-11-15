@@ -1479,13 +1479,14 @@ def build_order_text(
     order,
     title=None
 ):
-title = (
-    title
-    or (
-        f"📦 ЗАКАЗ KITTEK №{order['kittek_order_number']}"
-        if order.get("kittek_order_number")
-        else f"📦 ЗАКАЗ №{order['id']}"
+    title = (
+        title
+        or (
+            f"📦 ЗАКАЗ KITTEK №{order['kittek_order_number']}"
+            if order.get("kittek_order_number")
+            else f"📦 ЗАКАЗ №{order['id']}"
         )
+    )
 
     courier_name = (
         order["courier_name"]
