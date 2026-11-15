@@ -7673,12 +7673,12 @@ async def send_regular_store_orders(
                 )
 
         await target_message.answer(
-        (
+            (
             f"🚚 KITTEK №{order['kittek_order_number']}\n\n"
             if order.get("kittek_order_number")
             else f"🚚 ЗАКАЗ №{order['id']}\n\n"
-        )
-            f"Статус: "
+            )
+            + f"Статус: "
             f"{STATUS_NAMES.get(order['status'], order['status'])}\n"
             f"💰 Стоимость: "
             f"{price_text(order['delivery_price'])}\n\n"
