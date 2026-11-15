@@ -1144,6 +1144,17 @@ def optional_number(value):
 
     return value
 
+def order_display_number(order):
+    kittek = str(order.get("kittek_order_number") or "").strip()
+    internal_id = order.get("id")
+
+    if kittek:
+        return (
+            f"Kittek №{kittek}"
+            f" (ID бота: {internal_id})"
+        )
+
+    return f"Заказ №{internal_id} (внутренний номер)"
 
 async def get_store_membership(
     user_id: int
@@ -1476,16 +1487,12 @@ async def get_order_full(
 
 
 def build_order_text(
-    order,
+    order,  
     title=None
 ):
-    title = (
-        title
-        or (
-            f"📦 ЗАКАЗ KITTEK №{order['kittek_order_number']}"
-            if order.get("kittek_order_number")
-            else f"📦 ЗАКАЗ №{order['id']}"
-        )
+        title = (
+            title
+            or f"📦 {order_display_number(order)}"
     )
 
     courier_name = (
@@ -1547,6 +1554,7 @@ def build_order_text(
         f"💰 Стоимость: "
         f"{price_text(order['delivery_price'])}\n\n"
 
+        f"🆔 Внутренний ID: {order['id']}\n"
         f"🔢 Kittek №: "
         f"{optional_number(order['kittek_order_number'])}\n"
 
@@ -1924,7 +1932,7 @@ async def send_order_to_admin(
     documents = await get_order_documents(order_id)
     order_text = build_order_text(
         order,
-        title=f"🆕 НОВЫЙ ЗАКАЗ №{order_id}",
+        title=f"🆕 {order_display_number(order)}",
     )
 
     for admin_id in recipients:
@@ -1968,10 +1976,7 @@ async def publish_new_order(
         "orders",
         build_order_text(
             order,
-            title=(
-                f"🆕 НОВЫЙ ЗАКАЗ "
-                f"№{order_id}"
-            ),
+            title=f"🆕 {order_display_number(order)}",
         ),
     )
 
@@ -9937,7 +9942,7 @@ async def courier_full_queue(
 
         text += (
             f"{prefix} {position_text} — "
-            f"заказ №{order.get('kittek_order_number') or order['id']}"
+            f"{order_display_number(order)}\n"
             f"👤 {order['client_name']}\n"
             f"📍 {order['delivery_address']}\n"
             f"🕐 {order['delivery_time']}\n\n"
@@ -9945,10 +9950,7 @@ async def courier_full_queue(
 
         buttons.append([
             InlineKeyboardButton(
-                text=(
-                    f"{prefix} Заказ "
-                    f"№{order['id']}"
-                ),
+                text=f"{prefix} {order_display_number(order)}",
                 callback_data=(
                     f"courier_queue_order:"
                     f"{order['id']}"
@@ -12133,9 +12135,21 @@ async def send_stats_orders(message,day_text,search=None):
         rows=await conn.fetch("""SELECT o.id,o.kittek_order_number,o.client_name,o.status,s.store_name,COALESCE(c.full_name,'Не назначен') courier_name FROM orders o JOIN stores s ON s.id=o.store_id LEFT JOIN couriers c ON c.id=o.courier_id WHERE o.created_at >= $1 AND o.created_at < $2 AND ($3::text IS NULL OR o.id::text ILIKE $3 OR COALESCE(o.kittek_order_number,'') ILIKE $3 OR COALESCE(c.full_name,'') ILIKE $3 OR s.store_name ILIKE $3) ORDER BY o.id""",day,finish,None if not search else f"%{search}%")
     if not rows: await message.answer("Заказы не найдены."); return
     for r in rows[:100]:
-        await message.answer(f"📦 №{r['id']} | Kittek {optional_number(r['kittek_order_number'])}\n🏪 {r['store_name']}\n👤 {r['client_name']}\n🚚 {r['courier_name']}\n{STATUS_NAMES.get(r['status'],r['status'])}",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть заказ",callback_data=f"stats_open:{r['id']}")]]))
-
-@dp.callback_query(F.data.startswith("stats_orders:"))
+        await message.answer(
+    f"📦 {order_display_number(r)}\n"
+    f"🏪 {r['store_name']}\n"
+    f"👤 {r['client_name']}\n"
+    f"🚚 {r['courier_name']}\n"
+    f"{STATUS_NAMES.get(r['status'], r['status'])}",
+    reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Открыть заказ",
+                callback_data=f"stats_open:{r['id']}"
+            )
+        ]]
+    )
+)@dp.callback_query(F.data.startswith("stats_orders:"))
 async def stats_orders(callback:CallbackQuery):
     if await deny_admin_callback(callback): return
     await send_stats_orders(callback.message,callback.data.split(':')[1]); await callback.answer()
@@ -12303,11 +12317,7 @@ async def admin_new_orders(
         await message.answer(
             build_order_text(
                 order,
-
-                title=(
-                    f"🆕 ЗАКАЗ №"
-                    f"{order['id']}"
-                ),
+                title=f"🆕 {order_display_number(order)}"
             ),
 
             reply_markup=InlineKeyboardMarkup(
@@ -12512,7 +12522,7 @@ async def admin_active_courier_orders(callback: CallbackQuery):
         """,courier_id,list(QUEUE_ACTIVE_STATUSES))
     await callback.message.answer(f"🚚 {courier['full_name'] if courier else 'Курьер'} — {len(orders)} заказ(а)")
     for order in orders:
-        await callback.message.answer(build_order_text(order,title=f"🚚 ЗАКАЗ №{order['id']}"),reply_markup=admin_active_order_keyboard(order))
+        await callback.message.answer(build_order_text(order,title=f"🚚 {order_display_number(order)}"),reply_markup=admin_active_order_keyboard(order))
     await callback.message.answer("↩️ Вернуться к списку курьеров", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Назад к курьерам",callback_data="active_couriers_back")]]))
     await callback.answer()
 
@@ -12627,10 +12637,7 @@ async def admin_delivered_orders(
             build_order_text(
                 order,
 
-                title=(
-                    f"✅ ЗАКАЗ №"
-                    f"{order['id']}"
-                ),
+                title=f"✅ {order_display_number(order)}"
             ),
 
             reply_markup=keyboard,
@@ -12658,9 +12665,10 @@ async def admin_search_start(
         AdminSearch.order_id
     )
 
-    await message.answer(
+        await message.answer(
         "🔎 Введите номер заказа.\n\n"
-        "Например: 15"
+        "Можно искать по номеру Kittek "
+        "или внутреннему ID бота."
     )
 
 
@@ -12680,32 +12688,42 @@ async def admin_search_order(
 
         return
 
-    try:
+    search_value = (message.text or "").strip()
 
-        order_id = int(
-            (message.text or "").strip()
-        )
-
-    except ValueError:
-
-        await message.answer(
-            "❌ Введите только номер заказа."
-        )
-
+    if not search_value:
+        await message.answer("Введите номер Kittek или ID бота.")
         return
 
     await state.clear()
 
-    order = await get_order_full(
-        order_id
-    )
-
-    if not order:
-
-        await message.answer(
-            f"❌ Заказ №{order_id} не найден."
+    async with db_pool.acquire() as conn:
+        order_id = await conn.fetchval(
+            """
+            SELECT id
+            FROM orders
+            WHERE id::text = $1
+               OR kittek_order_number = $1
+            ORDER BY
+                CASE
+                    WHEN kittek_order_number = $1 THEN 0
+                    ELSE 1
+                END,
+                id DESC
+            LIMIT 1
+            """,
+            search_value,
         )
 
+    if not order_id:
+        await message.answer(
+            f"❌ Заказ с номером {search_value} не найден."
+        )
+        return
+
+    order = await get_order_full(order_id)
+
+    if not order:
+        await message.answer("❌ Заказ не найден.")
         return
 
     buttons = [
@@ -14204,8 +14222,9 @@ async def build_courier_queue_view(
 
         orders = await conn.fetch(
             """
-            SELECT
+         SELECT
                 o.id,
+                o.kittek_order_number,
                 o.queue_position,
                 o.status,
                 o.client_name,
