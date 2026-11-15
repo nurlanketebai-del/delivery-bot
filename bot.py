@@ -3215,13 +3215,13 @@ async def get_courier_order_card(
             )
 
     text = (
-    (
-        f"🚚 KITTEK №{order['kittek_order_number']}\n\n"
+        (
+            f"🚚 KITTEK №{order['kittek_order_number']}\n\n"
             if order.get("kittek_order_number")
             else f"🚚 ЗАКАЗ №{order['id']}\n\n"
-    )
-        f"🔢 Kittek №: "
-        f"{optional_number(order['kittek_order_number'])}\n"
+        )
+        + f"🔢 Kittek №: "
+        + f"{optional_number(order['kittek_order_number'])}\n"
 
         f"🛒 Kaspi №: "
         f"{optional_number(order['kaspi_order_number'])}\n\n"
