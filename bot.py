@@ -7676,7 +7676,7 @@ async def send_regular_store_orders(
         (
             f"🚚 KITTEK №{order['kittek_order_number']}\n\n"
             if order.get("kittek_order_number")
-          else f"🚚 ЗАКАЗ №{order['id']}\n\n"
+            else f"🚚 ЗАКАЗ №{order['id']}\n\n"
         )
             f"Статус: "
             f"{STATUS_NAMES.get(order['status'], order['status'])}\n"
