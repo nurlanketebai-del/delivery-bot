@@ -1490,9 +1490,9 @@ def build_order_text(
     order,  
     title=None
 ):
-        title = (
-            title
-            or f"📦 {order_display_number(order)}"
+    title = (
+        title
+        or f"📦 {order_display_number(order)}"
     )
 
     courier_name = (
