@@ -1479,11 +1479,14 @@ def build_order_text(
     order,
     title=None
 ):
-
-    title = (
-        title
-        or f"📦 ЗАКАЗ №{order['id']}"
+title = (
+    title
+    or (
+        f"📦 ЗАКАЗ KITTEK №{order['kittek_order_number']}"
+        if order.get("kittek_order_number")
+        else f"📦 ЗАКАЗ №{order['id']}"
     )
+)
 
     courier_name = (
         order["courier_name"]
@@ -2472,7 +2475,7 @@ async def build_store_status_timeline(
     creator_display = tg_link(order["created_by"], order["creator_telegram_id"])
 
     text = (
-        f"📦 СТАТУС ЗАКАЗА №{order_id}\n\n"
+        f"📦 СТАТУС ЗАКАЗА №{order.get('kittek_order_number') or order_id}\n\n"
         f"🔢 Kittek №: "
         f"{__import__('html').escape(str(optional_number(order['kittek_order_number'])))}\n"
         f"🛒 Kaspi №: "
@@ -3212,8 +3215,11 @@ async def get_courier_order_card(
             )
 
     text = (
-        f"🚚 ЗАКАЗ №{order['id']}\n\n"
-
+    (
+        f"🚚 KITTEK №{order['kittek_order_number']}\n\n"
+        if order.get("kittek_order_number")
+        else f"🚚 ЗАКАЗ №{order['id']}\n\n"
+    )
         f"🔢 Kittek №: "
         f"{optional_number(order['kittek_order_number'])}\n"
 
@@ -7667,7 +7673,11 @@ async def send_regular_store_orders(
                 )
 
         await target_message.answer(
-            f"📦 ЗАКАЗ №{order['id']}\n\n"
+        (
+            f"🚚 KITTEK №{order['kittek_order_number']}\n\n"
+            if order.get("kittek_order_number")
+          else f"🚚 ЗАКАЗ №{order['id']}\n\n"
+        )
             f"Статус: "
             f"{STATUS_NAMES.get(order['status'], order['status'])}\n"
             f"💰 Стоимость: "
@@ -9927,7 +9937,7 @@ async def courier_full_queue(
 
         text += (
             f"{prefix} {position_text} — "
-            f"заказ №{order['id']}\n"
+            f"заказ №{order.get('kittek_order_number') or order['id']}"
             f"👤 {order['client_name']}\n"
             f"📍 {order['delivery_address']}\n"
             f"🕐 {order['delivery_time']}\n\n"
@@ -14236,7 +14246,7 @@ async def build_courier_queue_view(
 
         text += (
             f"{order['queue_position']}️⃣ "
-            f"Заказ №{order['id']} — "
+            f"заказ №{order.get('kittek_order_number') or order['id']}"
             f"{STATUS_NAMES.get(order['status'], order['status'])}\n"
             f"🏪 {order['store_name']}\n"
             f"👤 {order['client_name']}\n"
@@ -14245,7 +14255,7 @@ async def build_courier_queue_view(
 
         buttons.append([
             InlineKeyboardButton(
-                text=f"🔝 №{order['id']}",
+                text=f"🔝 №{order.get('kittek_order_number') or order['id']}",
                 callback_data=(
                     f"queue_move:{courier_id}:"
                     f"{order['id']}:top"
